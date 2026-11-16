@@ -99,13 +99,13 @@ class MAVLinkClient:
             yaw_rate_rad_s,          # yaw_rate (rad/s)
         )
 
-    def send_yaw_rate(self, yaw_rate_deg_s: float):
-        """Chỉ gửi tốc độ góc quay Yaw (giữ nguyên vx = vy = vz = 0)."""
-        self.send_control_command(ControlCommand(yaw_rate=yaw_rate_deg_s))
-
     def stop_drone(self):
-        """Gửi lệnh dừng khẩn cấp (Hover đứng yên: vx=0, vy=0, vz=0, yaw_rate=0)."""
-        self.send_control_command(ControlCommand())
+        """Gửi lệnh dừng Hover (vx=0, vy=0, vz=0, yaw_rate=0) lặp 3 lần để chống rớt gói tin."""
+        zero_cmd = ControlCommand()
+        for _ in range(3):
+            self.send_control_command(zero_cmd)
+            if not self.dry_run and self.master is not None:
+                time.sleep(0.02)
 
     def close(self):
         """Gửi lệnh dừng drone và đóng cổng kết nối MAVLink."""
@@ -122,12 +122,11 @@ if __name__ == "__main__":
     parser.add_argument("--test-mock", action="store_true", help="Chạy kiểm thử logic ở chế độ dry-run không cần SITL")
     args = parser.parse_args()
 
-    print("=== Kiểm thử độc lập Module 7: mavlink_client.py ===")
+    print("=== Kiểm thử độc lập Module 3: mavlink_client.py ===")
     client = MAVLinkClient(conn_str=args.conn, baud=args.baud, dry_run=args.test_mock)
     client.connect()
     client.send_heartbeat_if_needed()
-    client.send_yaw_rate(10.0)
     client.send_control_command(ControlCommand(vx=0.5, yaw_rate=-8.0))
     client.close()
-    print("[PASS] Gửi Heartbeat, lệnh Yaw Rate và lệnh ControlCommand thành công!")
+    print("[PASS] Gửi Heartbeat, lệnh ControlCommand và dừng drone thành công!")
     print("=== Module mavlink_client.py hoạt động tốt! ===")

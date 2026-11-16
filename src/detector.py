@@ -9,7 +9,7 @@ from ultralytics import YOLO
 
 @dataclass
 class DetectedPerson:
-    """Thông tin một người được phát hiện và gán ID bởi bộ Multi-Object Tracker."""
+    """Thông tin một người được phát hiện và gán ID bởi ByteTrack."""
     track_id: int
     bbox: tuple[int, int, int, int]  # (x1, y1, x2, y2)
     conf: float
@@ -20,9 +20,12 @@ class DetectedPerson:
         return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
 
     @property
-    def area(self) -> int:
-        x1, y1, x2, y2 = self.bbox
-        return max(0, x2 - x1) * max(0, y2 - y1)
+    def width(self) -> float:
+        return max(1.0, float(self.bbox[2] - self.bbox[0]))
+
+    @property
+    def height(self) -> float:
+        return max(1.0, float(self.bbox[3] - self.bbox[1]))
 
     def contains_point(self, x: int, y: int) -> bool:
         x1, y1, x2, y2 = self.bbox
@@ -31,18 +34,21 @@ class DetectedPerson:
 
 class HumanDetector:
     """
-    Module nhận diện và định danh người (YOLOv8 + ByteTrack).
-    - Hỗ trợ tùy chỉnh imgsz (640 trên PC, 320 hoặc 416 trên Raspberry Pi 5 để tăng FPS).
-    - Hỗ trợ nạp cả model PyTorch (.pt) lẫn model NCNN/ONNX trên Raspberry Pi 5.
+    Module nhận diện và định danh người (YOLOv8n + ByteTrack).
+    - Hỗ trợ tùy chỉnh imgsz (640 trên PC Sim, 320 trên Raspberry Pi 5 để đạt FPS cao).
+    - Đặt conf_thresh=0.3 để ByteTrack tận dụng được vòng ghép thứ 2 (low-score association)
+      nhằm duy trì track_id bền vững khi camera quay hoặc người xoay ngang.
     """
     def __init__(
         self,
-        model_path: str = "yolov8n.pt",
-        conf_thresh: float = 0.5,
+        model_path: Optional[str] = None,
+        conf_thresh: float = 0.3,
         imgsz: int = 640,
         device: Optional[str] = None,
         tracker_config: str = "bytetrack.yaml",
     ):
+        if model_path is None:
+            model_path = str(Path(__file__).resolve().parent.parent / "models" / "yolov8n.pt")
         self.model = YOLO(model_path)
         self.conf_thresh = conf_thresh
         self.imgsz = imgsz
@@ -51,8 +57,8 @@ class HumanDetector:
 
     def detect_and_track(self, frame: np.ndarray) -> list[DetectedPerson]:
         """
-        Chạy YOLOv8 kèm ByteTrack để phát hiện tất cả người (class 0) và duy trì track_id.
-        Trả về danh sách DetectedPerson trong khung hình hiện tại.
+        Chạy YOLOv8 kèm ByteTrack để phát hiện người (class 0) và duy trì track_id.
+        Chỉ trả về các mục tiêu đã được ByteTrack cấp ID hợp lệ.
         """
         results = self.model.track(
             frame,
@@ -71,14 +77,12 @@ class HumanDetector:
             if boxes is None or len(boxes) == 0:
                 continue
 
-            for idx, box in enumerate(boxes):
+            for box in boxes:
+                if box.id is None:
+                    continue
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 conf = float(box.conf[0]) if box.conf is not None else 0.0
-
-                if box.id is not None:
-                    track_id = int(box.id[0])
-                else:
-                    track_id = -(idx + 1)
+                track_id = int(box.id[0])
 
                 detections.append(
                     DetectedPerson(
@@ -90,19 +94,10 @@ class HumanDetector:
 
         return detections
 
-    def detect(self, frame: np.ndarray) -> Optional[tuple[int, int, int, int]]:
-        """Hàm tương thích ngược: trả về bbox của người có diện tích lớn nhất."""
-        detections = self.detect_and_track(frame)
-        if not detections:
-            return None
-        best = max(detections, key=lambda d: d.area)
-        return best.bbox
-
 
 if __name__ == "__main__":
-    print("=== Kiểm thử độc lập Module 8: detector.py (HumanDetector YOLOv8 + ByteTrack) ===")
-    model_file = Path(__file__).resolve().parent / "models" / "yolov8n.pt"
-    detector = HumanDetector(model_path=str(model_file), imgsz=320)
+    print("=== Kiểm thử độc lập Module 4: detector.py (HumanDetector YOLOv8 + ByteTrack) ===")
+    detector = HumanDetector(imgsz=320)
 
     dummy_img = np.zeros((480, 640, 3), dtype=np.uint8)
     t0 = time.monotonic()

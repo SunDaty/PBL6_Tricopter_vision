@@ -1,14 +1,13 @@
 # src/camera.py
 import argparse
 import threading
-import time
 from typing import Optional
 import cv2
 import numpy as np
 
 
 class BaseCamera:
-    """Giao diện chuẩn cho mọi nguồn Camera (Gazebo, Raspberry Pi Camera v3, USB/Video)."""
+    """Giao diện chuẩn cho mọi nguồn Camera (Gazebo Sim, Raspberry Pi Camera v3, Mock)."""
     def start(self):
         pass
 
@@ -21,8 +20,8 @@ class BaseCamera:
 
 class GazeboCamera(BaseCamera):
     """
-    Nguồn nhận ảnh từ Gazebo Transport (chỉ dùng trong chế độ mô phỏng --mode sim).
-    Import thư viện gz.transport13 bên trong hàm để khi chép sang Raspberry Pi 5 không bị lỗi.
+    Nguồn nhận ảnh từ Gazebo Transport (dùng trong chế độ mô phỏng --mode sim).
+    Import thư viện gz.transport13 bên trong hàm start() để khi chạy trên Raspberry Pi 5 không cần cài Gazebo.
     """
     def __init__(self, topic: str = "/camera/image_raw", width: int = 640, height: int = 480):
         self.topic = topic
@@ -98,7 +97,7 @@ class PiCameraV3(BaseCamera):
         self._picam2.configure(config)
         self._picam2.start()
 
-        # Bật lấy nét tự động liên tục (Continuous Autofocus) trên Camera Module v3 nếu hỗ trợ
+        # Bật lấy nét tự động liên tục (Continuous Autofocus) trên Camera Module v3
         try:
             self._picam2.set_controls({"AfMode": 2})
         except Exception:
@@ -112,10 +111,9 @@ class PiCameraV3(BaseCamera):
         frame = self._picam2.capture_array("main")
         if frame is None:
             return None
-        # Picamera2 cấu hình RGB888 thực tế trả về mảng thứ tự BGR cho OpenCV
         if (frame.shape[1], frame.shape[0]) != (self.width, self.height):
             frame = cv2.resize(frame, (self.width, self.height))
-        return frame
+        return np.ascontiguousarray(frame)
 
     def stop(self):
         if self._picam2 is not None:
@@ -148,7 +146,7 @@ def create_camera(
     width: int = 640,
     height: int = 480,
 ) -> BaseCamera:
-    """Hàm khởi tạo nguồn camera theo chế độ ('sim', 'real', hoặc 'mock')."""
+    """Khởi tạo nguồn camera theo chế độ ('sim', 'real', hoặc 'mock')."""
     mode = mode.lower()
     if mode == "sim":
         return GazeboCamera(topic=image_topic, width=width, height=height)
@@ -167,7 +165,7 @@ if __name__ == "__main__":
     parser.add_argument("--test-mock", action="store_true", help="Chạy tự kiểm thử nhanh với MockCamera")
     args = parser.parse_args()
 
-    print("=== Kiểm thử độc lập Module 6: camera.py ===")
+    print("=== Kiểm thử độc lập Module 2: camera.py ===")
     cam_mode = "mock" if args.test_mock else args.mode
     cam = create_camera(mode=cam_mode, image_topic=args.topic)
     cam.start()

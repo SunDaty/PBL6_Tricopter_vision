@@ -1,21 +1,25 @@
 # src/tracker.py
+from collections import deque
+import math
+import time
 from typing import Optional
 
-from controller import ControlCommand
+from controller import ControlCommand, PIDController
 from detector import DetectedPerson
-from distance_tracker import DistanceTracker
-from selector import TargetSelector, TrackingState
-from yaw_tracker import YawOnlyTracker
 
 
-class YawTracker:
+class TargetTracker:
     """
-    Bộ Tracker TỔNG HỢP dùng trong vòng lặp điều khiển chung:
-    Kết hợp 3 thành phần con đã tách riêng:
-    1. TargetSelector (selector.py): Lựa chọn và khóa ID mục tiêu.
-    2. YawOnlyTracker (yaw_tracker.py): Điều khiển góc hướng Yaw (deg/s).
-    3. DistanceTracker (distance_tracker.py): Điều khiển tiến/lùi Vx (m/s) có Deadband pixel
-       và tự động chốt cự ly chuẩn khi bắt đầu khóa mục tiêu.
+    Module điều khiển bám mục tiêu hợp nhất (dùng chung cho Gazebo Sim & Raspberry Pi 5):
+    1. Chọn và khóa ID mục tiêu khi người dùng Click chuột trái (`select_by_point`).
+    2. Điều khiển góc quay Yaw (`yaw_rate` deg/s) giữ mục tiêu ở tâm ngang khung hình.
+    3. Điều khiển khoảng cách Tiến/Lùi (`vx` m/s) độ trễ thấp & mượt:
+       - Lọc Median 3-frame + EMA nhanh (alpha=0.55) giúp khử nhiễu nhảy bbox mà không gây trễ pha.
+       - Hàm sai số khoảng cách đối xứng chuẩn quang học:
+           + Đi xa (cur_h < ref_h)  : e = (ref_h / cur_h) - 1.0  (tỉ lệ thuận với khoảng cách thực Z)
+           + Lại gần (cur_h > ref_h): e = -((cur_h / ref_h) - 1.0)
+       - Vùng chết nhỏ ±5% kèm vận tốc khởi động tối thiểu (min_vx=0.15 m/s) để thắng quán tính ngay.
+       - Bộ giới hạn gia tốc (Slew-Rate Limiter) giúp mũi Tricopter nghiêng Pitch êm ái, không giật cục.
     """
     def __init__(
         self,
@@ -23,122 +27,72 @@ class YawTracker:
         frame_height: int = 480,
         yaw_kp: float = 0.08,
         yaw_kd: float = 0.01,
-        yaw_deadband: float = 15.0,
+        yaw_deadband_px: float = 15.0,
         max_yaw_rate: float = 25.0,
-        enable_distance_tracking: bool = False,
-        initial_ref_height_px: Optional[float] = None,
-        dist_kp: float = 0.015,
-        dist_kd: float = 0.003,
-        dist_deadband_px: float = 12.0,
+        dist_kp: float = 1.6,
+        dist_deadband_ratio: float = 0.05,
+        min_vx: float = 0.15,
         max_vx: float = 1.2,
+        max_vx_accel: float = 1.8,
+        max_vx_decel: float = 2.5,
+        height_ema_alpha: float = 0.55,
         lost_timeout: float = 2.0,
-        center_weight: float = 0.6,
-        area_weight: float = 0.4,
     ):
         self.frame_width = frame_width
         self.frame_height = frame_height
         self.center_x = frame_width / 2.0
-        self.yaw_deadband = yaw_deadband
-        self.dist_deadband_px = dist_deadband_px
-        self.enable_distance_tracking = enable_distance_tracking
+        self.yaw_deadband_px = yaw_deadband_px
 
-        # 1. Bộ lựa chọn & khóa mục tiêu độc lập
-        self.selector = TargetSelector(
-            frame_width=frame_width,
-            frame_height=frame_height,
-            lost_timeout=lost_timeout,
-            center_weight=center_weight,
-            area_weight=area_weight,
+        self.dist_kp = dist_kp
+        self.dist_deadband_ratio = dist_deadband_ratio
+        self.min_vx = min_vx
+        self.max_vx = max_vx
+        self.max_vx_accel = max_vx_accel
+        self.max_vx_decel = max_vx_decel
+        self.height_ema_alpha = height_ema_alpha
+        self.lost_timeout = lost_timeout
+
+        # Trạng thái mục tiêu đang khóa
+        self.locked_id: Optional[int] = None
+        self.last_seen_time: Optional[float] = None
+        self.ref_height_px: Optional[float] = None
+        self._ref_width_px: Optional[float] = None
+        self.current_height_px: Optional[float] = None
+        self._height_window: deque[float] = deque(maxlen=3)
+        self._current_vx: float = 0.0
+        self._last_vx_time: Optional[float] = None
+
+        # Bộ điều khiển PD cho góc Yaw (đầu vào: error_x_px, đầu ra: deg/s)
+        self.yaw_pid = PIDController(
+            kp=yaw_kp,
+            kd=yaw_kd,
+            deadband=yaw_deadband_px,
+            output_limits=(-max_yaw_rate, max_yaw_rate),
         )
-
-        # 2. Bộ điều khiển góc Yaw độc lập
-        self.yaw_tracker = YawOnlyTracker(
-            frame_width=frame_width,
-            yaw_kp=yaw_kp,
-            yaw_kd=yaw_kd,
-            yaw_deadband=yaw_deadband,
-            max_yaw_rate=max_yaw_rate,
-        )
-
-        # 3. Bộ điều khiển khoảng cách Tiến/Lùi độc lập (có Deadband pixel & Auto-Reference)
-        self.distance_tracker = DistanceTracker(
-            frame_height=frame_height,
-            initial_ref_height_px=initial_ref_height_px,
-            dist_kp=dist_kp,
-            dist_kd=dist_kd,
-            dist_deadband_px=dist_deadband_px,
-            max_vx=max_vx,
-        )
-
-    @property
-    def state(self) -> TrackingState:
-        return self.selector.state
-
-    @property
-    def locked_id(self) -> Optional[int]:
-        return self.selector.locked_id
-
-    @property
-    def lost_timeout(self) -> float:
-        return self.selector.lost_timeout
-
-    @property
-    def ref_height_px(self) -> Optional[float]:
-        return self.distance_tracker.ref_height_px
-
-    @property
-    def current_height_px(self) -> Optional[float]:
-        return self.distance_tracker.current_height_px
-
-    @property
-    def error_height_px(self) -> Optional[float]:
-        return self.distance_tracker.last_error_height_px
-
-    def reset_controllers(self, keep_distance_ref: bool = True):
-        """Xóa trạng thái tích phân/đạo hàm của bộ điều khiển Yaw và Distance."""
-        self.yaw_tracker.reset()
-        self.distance_tracker.reset(keep_reference=keep_distance_ref)
 
     def reset(self):
-        """Khôi phục toàn bộ trạng thái về tự động tìm kiếm ban đầu."""
-        self.reset_controllers(keep_distance_ref=False)
-        self.selector.reset()
+        """Xóa mục tiêu đang khóa và đưa bộ điều khiển về trạng thái chờ (Hover)."""
+        self.locked_id = None
+        self.last_seen_time = None
+        self.ref_height_px = None
+        self._ref_width_px = None
+        self.current_height_px = None
+        self._height_window.clear()
+        self._current_vx = 0.0
+        self._last_vx_time = None
+        self.yaw_pid.reset()
 
-    def unlock_target(self):
-        """Hủy khóa mục tiêu hiện tại và chuyển sang trạng thái Hover chờ người dùng chọn."""
-        self.reset_controllers(keep_distance_ref=False)
-        self.selector.unlock()
-
-    def trigger_auto_select(self):
-        """Kích hoạt chế độ tự động chọn mục tiêu tối ưu nhất."""
-        self.reset_controllers(keep_distance_ref=False)
-        self.selector.trigger_auto_select()
-
-    def toggle_distance_tracking(self) -> bool:
-        """
-        Bật/tắt nhanh chế độ tiến/lùi ngay trong lúc chạy.
-        Khi bật lên sẽ tự động lấy khoảng cách hiện tại của mục tiêu làm chuẩn để không bị trôi.
-        """
-        self.enable_distance_tracking = not self.enable_distance_tracking
-        self.distance_tracker.reset(keep_reference=False)
-        return self.enable_distance_tracking
-
-    def recalibrate_distance(self, active_target: Optional[DetectedPerson] = None) -> Optional[float]:
-        """Chốt lại chiều cao hiện tại của mục tiêu làm mốc cự ly chuẩn mới."""
-        bbox = active_target.bbox if active_target is not None else self.selector.last_known_bbox
-        if bbox is not None:
-            return self.distance_tracker.recalibrate_from_bbox(bbox)
-        self.distance_tracker.reset(keep_reference=False)
-        return None
-
-    def adjust_reference_height(self, delta_px: float) -> Optional[float]:
-        """Tăng/giảm chiều cao chuẩn mong muốn bằng phím +/-."""
-        return self.distance_tracker.adjust_reference_height(delta_px)
-
-    def lock_target_id(self, track_id: int, now: Optional[float] = None):
-        """Khóa trực tiếp vào một track_id cụ thể."""
-        if self.selector.lock_id(track_id, now=now):
-            self.reset_controllers(keep_distance_ref=False)
+    def _calibrate_reference(self, person: DetectedPerson, now: float):
+        """Chốt chiều cao và bề rộng khung bao lúc vừa chọn mục tiêu làm mốc chuẩn."""
+        raw_h = max(50.0, min(float(self.frame_height * 0.85), person.height))
+        self.ref_height_px = raw_h
+        self._ref_width_px = max(20.0, person.width)
+        self.current_height_px = raw_h
+        self._height_window.clear()
+        self._height_window.append(raw_h)
+        self._current_vx = 0.0
+        self._last_vx_time = now
+        self.yaw_pid.reset()
 
     def select_by_point(
         self,
@@ -147,126 +101,190 @@ class YawTracker:
         detections: list[DetectedPerson],
         now: Optional[float] = None,
     ) -> Optional[int]:
-        """Chọn mục tiêu tại tọa độ click chuột (x, y) và chốt luôn khoảng cách chuẩn của người đó."""
-        prev_id = self.selector.locked_id
-        chosen_id = self.selector.select_by_point(x, y, detections, now=now)
-        if chosen_id is not None and chosen_id != prev_id:
-            self.reset_controllers(keep_distance_ref=False)
-            if self.selector.last_known_bbox is not None:
-                self.distance_tracker.recalibrate_from_bbox(self.selector.last_known_bbox)
-        return chosen_id
+        """
+        Chọn mục tiêu tại tọa độ click chuột trái (x, y) và chốt ngay cự ly hiện tại làm chuẩn.
+        Nếu nhiều khung bao chồng lấn, ưu tiên người có tâm gần điểm click nhất.
+        """
+        candidates = [d for d in detections if d.contains_point(x, y)]
+        if not candidates:
+            return None
 
-    def cycle_target(
-        self,
-        detections: list[DetectedPerson],
-        now: Optional[float] = None,
-    ) -> Optional[int]:
-        """Chuyển đổi luân phiên sang người tiếp theo trong khung hình."""
-        prev_id = self.selector.locked_id
-        chosen_id = self.selector.cycle_target(detections, now=now)
-        if chosen_id is not None and chosen_id != prev_id:
-            self.reset_controllers(keep_distance_ref=False)
-            if self.selector.last_known_bbox is not None:
-                self.distance_tracker.recalibrate_from_bbox(self.selector.last_known_bbox)
-        return chosen_id
+        current_time = now if now is not None else time.monotonic()
+        chosen = min(
+            candidates,
+            key=lambda d: (d.center[0] - x) ** 2 + (d.center[1] - y) ** 2,
+        )
+        self.locked_id = chosen.track_id
+        self.last_seen_time = current_time
+        self._calibrate_reference(chosen, now=current_time)
+        return chosen.track_id
 
     def get_occlusion_elapsed(self, now: Optional[float] = None) -> float:
         """Thời gian (giây) kể từ lần cuối nhìn thấy mục tiêu đang khóa."""
-        return self.selector.get_occlusion_elapsed(now=now)
+        if self.locked_id is None or self.last_seen_time is None:
+            return 0.0
+        current_time = now if now is not None else time.monotonic()
+        return max(0.0, current_time - self.last_seen_time)
 
-    def update_targets(
+    def _compute_effective_height(self, person: DetectedPerson) -> float:
+        """
+        Tính chiều cao mục tiêu có khử nhiễu gai (Median-of-3) + EMA nhanh (alpha=0.55):
+        - Khi người tiến quá sát làm chân/đầu chạm mép ảnh (y2 >= H-8 hoặc y1 <= 8)
+          và bề rộng phình to hơn lúc khóa, ước lượng qua tỉ lệ bề rộng để drone lùi lại an toàn.
+        """
+        _, y1, _, y2 = person.bbox
+        raw_h = person.height
+        raw_w = person.width
+
+        is_clipped = (y2 >= self.frame_height - 8) or (y1 <= 8)
+        if is_clipped and self.ref_height_px is not None and self._ref_width_px is not None:
+            width_scale = raw_w / self._ref_width_px
+            if width_scale > 1.08:
+                raw_h = max(raw_h, self.ref_height_px * width_scale)
+
+        self._height_window.append(raw_h)
+        sorted_w = sorted(self._height_window)
+        median_h = sorted_w[len(sorted_w) // 2]
+
+        if self.current_height_px is None:
+            self.current_height_px = median_h
+        else:
+            self.current_height_px = (
+                self.height_ema_alpha * median_h
+                + (1.0 - self.height_ema_alpha) * self.current_height_px
+            )
+        return self.current_height_px
+
+    def _compute_smooth_vx(self, cur_h: float, now: float) -> float:
+        """
+        Tính vận tốc tiến/lùi vx (m/s) có bù quán tính khởi động và giới hạn gia tốc (Slew-Rate).
+        """
+        if self.ref_height_px is None or cur_h <= 1.0:
+            self._current_vx = 0.0
+            self._last_vx_time = now
+            return 0.0
+
+        # Sai số khoảng cách đối xứng chuẩn quang học:
+        # > 0 khi người đi xa (cur_h < ref_h), < 0 khi người lại gần (cur_h > ref_h)
+        if cur_h <= self.ref_height_px:
+            dist_error = (self.ref_height_px / cur_h) - 1.0
+        else:
+            dist_error = -((cur_h / self.ref_height_px) - 1.0)
+
+        # Vùng chết mềm ±5% kèm bù vận tốc khởi động tối thiểu (min_vx)
+        if abs(dist_error) <= self.dist_deadband_ratio:
+            target_vx = 0.0
+        else:
+            eff_err = math.copysign(abs(dist_error) - self.dist_deadband_ratio, dist_error)
+            raw_vx = math.copysign(self.min_vx, eff_err) + self.dist_kp * eff_err
+            target_vx = max(-self.max_vx, min(self.max_vx, raw_vx))
+
+        # Giới hạn gia tốc (Slew-Rate Limiter) giúp lệnh vận tốc biến thiên mượt mà
+        dt = (
+            now - self._last_vx_time
+            if (self._last_vx_time is not None and now > self._last_vx_time)
+            else 0.0
+        )
+        self._last_vx_time = now
+
+        if dt <= 0.0 or dt > 0.5:
+            # Nếu là bước đầu tiên hoặc sau quãng nghỉ dài, cho phép cập nhật trực tiếp
+            self._current_vx = target_vx
+            return self._current_vx
+
+        delta_vx = target_vx - self._current_vx
+        # Dùng max_vx_decel khi đang giảm tốc về 0 hoặc đảo chiều, dùng max_vx_accel khi tăng tốc
+        is_braking = (abs(target_vx) < abs(self._current_vx)) or (target_vx * self._current_vx < 0.0)
+        rate_limit = self.max_vx_decel if is_braking else self.max_vx_accel
+        max_step = rate_limit * dt
+
+        if abs(delta_vx) > max_step:
+            self._current_vx += math.copysign(max_step, delta_vx)
+        else:
+            self._current_vx = target_vx
+
+        return self._current_vx
+
+    def update(
         self,
         detections: list[DetectedPerson],
         now: Optional[float] = None,
     ) -> tuple[ControlCommand, Optional[DetectedPerson]]:
         """
-        Cập nhật danh sách người phát hiện được qua TargetSelector và tính lệnh điều khiển
-        tổng hợp (Yaw + Tịnh tiến lồng nhau).
+        Cập nhật danh sách phát hiện ở frame hiện tại và tính lệnh điều khiển (vx, yaw_rate).
+        - Nếu chưa chọn mục tiêu hoặc đang khuất bóng: trả về lệnh 0 (Hover).
+        - Nếu mất dấu quá `lost_timeout`: tự động hủy khóa về trạng thái chờ chọn lại.
         """
-        prev_id = self.selector.locked_id
-        target, should_reset_pid = self.selector.update(detections, now=now)
+        current_time = now if now is not None else time.monotonic()
 
-        if target is not None and target.track_id != prev_id:
-            # Khi mới khóa vào một ID mới -> chốt chiều cao của ID đó làm mốc chuẩn
-            self.reset_controllers(keep_distance_ref=False)
-            self.distance_tracker.recalibrate_from_bbox(target.bbox)
-        elif should_reset_pid:
-            # Khi bị khuất ngắn hạn -> giữ nguyên mốc ref_height_px nhưng xóa tích phân/đạo hàm PID
-            self.reset_controllers(keep_distance_ref=(self.selector.locked_id is not None))
-
-        if target is None:
+        if self.locked_id is None:
             return ControlCommand(), None
 
-        return self.compute_command(target.bbox, now=now), target
+        target = next((d for d in detections if d.track_id == self.locked_id), None)
+        if target is None:
+            # Mục tiêu tạm thời khuất bóng -> giảm tốc mượt hoặc Hover
+            self.yaw_pid.reset()
+            self._current_vx = 0.0
+            self._last_vx_time = current_time
+            if self.get_occlusion_elapsed(now=current_time) > self.lost_timeout:
+                self.reset()
+            return ControlCommand(), None
 
-    def compute_command(
-        self,
-        bbox: Optional[tuple[int, int, int, int]],
-        now: Optional[float] = None,
-    ) -> ControlCommand:
-        """
-        Tính toán lệnh điều khiển tổng hợp (vx, vy, vz, yaw_rate) bằng cách gọi
-        YawOnlyTracker và DistanceTracker.
-        """
-        if bbox is None:
-            self.reset_controllers(keep_distance_ref=True)
-            return ControlCommand()
+        self.last_seen_time = current_time
+        if self.ref_height_px is None:
+            self._calibrate_reference(target, now=current_time)
 
-        yaw_rate = self.yaw_tracker.compute_yaw_rate(bbox, now=now)
+        # 1. Tính tốc độ góc quay Yaw (deg/s) từ độ lệch ngang so với tâm màn hình
+        error_x = target.center[0] - self.center_x
+        yaw_rate = self.yaw_pid.compute(error_x, now=current_time)
 
-        vx = 0.0
-        if self.enable_distance_tracking:
-            vx = self.distance_tracker.compute_vx(bbox, now=now)
-        else:
-            # Vẫn cập nhật chiều cao đo đạc để hiển thị trên HUD ngay cả khi đang tắt Vx
-            if self.distance_tracker.ref_height_px is None:
-                self.distance_tracker.recalibrate_from_bbox(bbox)
-            else:
-                h = self.distance_tracker.compute_effective_height_px(bbox)
-                if h is not None:
-                    self.distance_tracker._last_error_height_px = (
-                        self.distance_tracker.ref_height_px - h
-                    )
+        # 2. Tính vận tốc Tiến/Lùi Vx (m/s) mượt và độ trễ thấp
+        cur_h = self._compute_effective_height(target)
+        vx = self._compute_smooth_vx(cur_h, now=current_time)
 
-        return ControlCommand(vx=vx, vy=0.0, vz=0.0, yaw_rate=yaw_rate)
-
-    def compute_yaw_rate(self, bbox: Optional[tuple[int, int, int, int]]) -> float:
-        """Chỉ trả về tốc độ góc yaw (deg/s) thông qua YawOnlyTracker."""
-        return self.yaw_tracker.compute_yaw_rate(bbox)
+        return ControlCommand(vx=vx, vy=0.0, vz=0.0, yaw_rate=yaw_rate), target
 
 
-# Alias rõ nghĩa cho bộ Tracker tổng hợp
-CombinedTracker = YawTracker
+# Alias tương thích
+CombinedTracker = TargetTracker
 
 
 if __name__ == "__main__":
-    print("=== Kiểm thử độc lập Module 5: tracker.py (CombinedTracker: Yaw + Distance) ===")
-    tracker = CombinedTracker(enable_distance_tracking=True, lost_timeout=2.0)
+    print("=== Kiểm thử độc lập Module 5: tracker.py (TargetTracker: Select + Yaw + Smooth Distance) ===")
+    tracker = TargetTracker(height_ema_alpha=1.0, lost_timeout=2.0)
 
-    # 1. Lần đầu khóa mục tiêu (cao 140px) -> Tự lấy 140px làm mốc chuẩn, vx = 0.0 (Không bị trôi!)
-    p1_init = DetectedPerson(track_id=1, bbox=(400, 170, 480, 310), conf=0.92)
-    cmd_init, active = tracker.update_targets([p1_init], now=0.0)
-    assert active is not None and cmd_init.vx == 0.0 and cmd_init.yaw_rate > 0
+    # 1. Chưa chọn mục tiêu -> Drone Hover đứng yên (vx=0, yaw_rate=0)
+    p1 = DetectedPerson(track_id=1, bbox=(400, 170, 480, 310), conf=0.92)
+    cmd_idle, active = tracker.update([p1], now=0.0)
+    assert active is None and cmd_idle.vx == 0.0 and cmd_idle.yaw_rate == 0.0
+    print("[PASS] 1. Khi chưa click chọn mục tiêu -> Drone Hover đứng yên")
+
+    # 2. Click chuột trái vào người #1 (cao 140px, tâm x=440 lệch phải +120px)
+    chosen_id = tracker.select_by_point(440, 240, [p1], now=0.1)
+    cmd_lock, active = tracker.update([p1], now=0.1)
+    assert chosen_id == 1 and active is not None
+    assert cmd_lock.vx == 0.0 and cmd_lock.yaw_rate > 0.0
     print(
-        f"[PASS] 1. Vừa khóa ID #{active.track_id} (ref_h={tracker.ref_height_px:.0f}px): "
-        f"yaw_rate={cmd_init.yaw_rate:+.2f} deg/s, vx={cmd_init.vx:+.2f} m/s (Không bị trôi!)"
+        f"[PASS] 2. Click khóa ID #{chosen_id} (ref_h={tracker.ref_height_px:.0f}px): "
+        f"yaw_rate={cmd_lock.yaw_rate:+.2f} deg/s, vx={cmd_lock.vx:+.2f} m/s (Không bị tự trôi)"
     )
 
-    # 2. Mục tiêu đi ra xa (cao giảm xuống 90px) -> Tiến theo (vx > 0)
+    # 3. Người đi ra xa (chiều cao giảm xuống 90px) -> Tăng tốc mượt tiến theo (vx > 0)
     p1_far = DetectedPerson(track_id=1, bbox=(400, 195, 480, 285), conf=0.92)
-    cmd_far, _ = tracker.update_targets([p1_far], now=0.5)
-    assert cmd_far.vx > 0
-    print(
-        f"[PASS] 2. Mục tiêu đi xa (h={tracker.current_height_px:.0f}px): "
-        f"yaw_rate={cmd_far.yaw_rate:+.2f} deg/s, vx={cmd_far.vx:+.2f} m/s (Tiến tới)"
-    )
+    tracker.update([p1_far], now=0.3)
+    cmd_far, _ = tracker.update([p1_far], now=0.5)
+    assert cmd_far.vx > 0.0
+    print(f"[PASS] 3. Mục tiêu đi xa (h={tracker.current_height_px:.0f}px) -> vx={cmd_far.vx:+.2f} m/s (Tiến theo mượt)")
 
-    # 3. Mục tiêu tiến lại gần (cao tăng lên 210px) -> Lùi lại (vx < 0)
-    p1_close = DetectedPerson(track_id=1, bbox=(380, 135, 500, 345), conf=0.95)
-    cmd_close, _ = tracker.update_targets([p1_close], now=1.0)
-    assert cmd_close.vx < 0
-    print(
-        f"[PASS] 3. Mục tiêu lại gần (h={tracker.current_height_px:.0f}px): "
-        f"yaw_rate={cmd_close.yaw_rate:+.2f} deg/s, vx={cmd_close.vx:+.2f} m/s (Lùi lại)"
-    )
+    # 4. Người bước lại gần (chiều cao tăng lên 200px) -> Đảo chiều mượt lùi lại (vx < 0)
+    p1_close = DetectedPerson(track_id=1, bbox=(380, 140, 500, 340), conf=0.95)
+    tracker.update([p1_close], now=0.8)
+    cmd_close, _ = tracker.update([p1_close], now=1.2)
+    assert cmd_close.vx < 0.0
+    print(f"[PASS] 4. Mục tiêu lại gần (h={tracker.current_height_px:.0f}px) -> vx={cmd_close.vx:+.2f} m/s (Lùi lại mượt)")
+
+    # 5. Mất dấu quá lost_timeout (2.0s) -> Tự động về trạng thái chờ chọn lại
+    tracker.update([], now=3.5)
+    assert tracker.locked_id is None
+    print("[PASS] 5. Khuất bóng quá 2.0s -> Tự động hủy khóa và Hover an toàn")
     print("=== Module tracker.py hoạt động tốt! ===")
