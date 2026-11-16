@@ -7,6 +7,7 @@ import cv2
 from camera import create_camera
 from detector import DetectedPerson, HumanDetector
 from mavlink_client import MAVLinkClient
+from metrics import DebugMetrics
 from tracker import TargetTracker
 from visualizer import TelemetryStats, TrackingVisualizer
 
@@ -29,9 +30,17 @@ class DroneTrackerApp:
         lost_timeout: float = 2.0,
         headless: bool = False,
         dry_run_mavlink: bool = False,
+        debug: bool = False,
+        debug_dir: str = None,
+        hfov: float = 66.0,
     ):
         self.mode = mode
         self.headless = headless
+        self.debug = debug
+        self.show_debug = debug
+        self.metrics = None
+        self._frame_idx = 0
+        self._last_debug_print = 0.0
 
         # 1. Kết nối MAVLink (ArduPilot SITL hoặc Pixhawk 6C)
         self.mavlink = MAVLinkClient(
@@ -39,6 +48,15 @@ class DroneTrackerApp:
             baud=baud,
             dry_run=dry_run_mavlink,
         )
+        if debug:
+            if debug_dir is None:
+                debug_dir = str(
+                    Path(__file__).resolve().parent / "debug_metrics" / time.strftime("%Y%m%d_%H%M%S")
+                )
+            self.metrics = DebugMetrics(debug_dir, deadband_px=15.0, hfov_deg=hfov, frame_width=640)
+            self.mavlink.on_attitude = self.metrics.on_attitude
+            self.mavlink.clock_sync = self.metrics.clock_sync
+            print(f"[*] [DEBUG] Ghi metrics vào: {debug_dir}")
         self.mavlink.connect()
 
         # 2. Khởi tạo Detector (YOLOv8n + ByteTrack), TargetTracker & Visualizer
@@ -98,27 +116,43 @@ class DroneTrackerApp:
                     continue
 
                 loop_start = time.monotonic()
+                t_capture = self.camera.last_capture_time or loop_start
                 fps = self.visualizer.update_fps(now=loop_start)
 
                 # 1. Phát hiện và định danh người bằng YOLOv8n + ByteTrack
                 infer_start = time.monotonic()
                 detections = self.detector.detect_and_track(frame)
-                infer_latency_ms = (time.monotonic() - infer_start) * 1000.0
+                infer_end = time.monotonic()
+                infer_latency_ms = (infer_end - infer_start) * 1000.0
                 self._latest_detections = detections
 
                 # 2. Tính lệnh điều khiển (Yaw + Tiến/Lùi) cho mục tiêu đã chọn
                 cmd, active_target = self.tracker.update(detections)
 
                 # 3. Gửi lệnh vận tốc tới ArduPilot / Pixhawk 6C
-                self.mavlink.send_control_command(cmd)
+                t_cmd_sent = self.mavlink.send_control_command(cmd)
 
                 # 4. Hiển thị HUD & Telemetry
-                total_latency_ms = (time.monotonic() - loop_start) * 1000.0
+                total_latency_ms = (time.monotonic() - t_capture) * 1000.0
                 error_x_px = (
                     active_target.center[0] - self.tracker.center_x
                     if active_target is not None
                     else None
                 )
+
+                debug_lines = None
+                if self.metrics is not None:
+                    self.metrics.on_frame(
+                        self._frame_idx, t_capture, infer_start, infer_end, t_cmd_sent,
+                        detections, self.tracker.locked_id, error_x_px, cmd.yaw_rate, cmd.vx,
+                    )
+                    self._frame_idx += 1
+                    lines = self.metrics.hud_lines()
+                    if self.show_debug:
+                        debug_lines = lines
+                    if loop_start - self._last_debug_print >= 1.0:
+                        self._last_debug_print = loop_start
+                        print("[DEBUG] " + " | ".join(lines))
 
                 stats = TelemetryStats(
                     fps=fps,
@@ -133,6 +167,7 @@ class DroneTrackerApp:
                     lost_timeout_s=self.tracker.lost_timeout,
                     yaw_rate_deg_s=cmd.yaw_rate,
                     vx_m_s=cmd.vx,
+                    debug_lines=debug_lines,
                 )
 
                 self.visualizer.log_to_terminal(stats)
@@ -140,14 +175,19 @@ class DroneTrackerApp:
                 if not self.headless:
                     self.visualizer.draw_hud(frame, detections, stats)
                     cv2.imshow(WINDOW_NAME, frame)
-                    if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord("q"):
                         break
+                    if key == ord("d") and self.metrics is not None:
+                        self.show_debug = not self.show_debug
 
         except KeyboardInterrupt:
             print("\n[*] Dừng chương trình bởi người dùng.")
         finally:
             self.camera.stop()
             self.mavlink.close()
+            if self.metrics is not None:
+                print(self.metrics.close())
             if not self.headless:
                 cv2.destroyAllWindows()
 
@@ -195,6 +235,10 @@ def parse_args():
         action="store_true",
         help="Chạy không mở cửa sổ OpenCV",
     )
+    parser.add_argument("--debug", action="store_true", help="Bật đo đạc: FPS, độ trễ, ID, overshoot yaw, E2E (HUD+CSV+báo cáo)")
+    parser.add_argument("--debug-dir", default=None, help="Thư mục lưu CSV/báo cáo debug")
+    parser.add_argument("--hfov", type=float, default=66.0, help="FOV ngang camera (độ) để quy đổi sai số pixel -> góc")
+    parser.add_argument("--dry-run-mavlink", action="store_true", help="Không kết nối MAVLink thật (giả lập attitude khi --debug)")
     return parser.parse_args()
 
 
@@ -217,5 +261,9 @@ if __name__ == "__main__":
         imgsz=yolo_imgsz,
         lost_timeout=args.lost_timeout,
         headless=args.headless,
+        dry_run_mavlink=args.dry_run_mavlink,
+        debug=args.debug,
+        debug_dir=args.debug_dir,
+        hfov=args.hfov,
     )
     app.run()

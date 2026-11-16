@@ -1,6 +1,7 @@
 # src/mavlink_client.py
 import argparse
 import math
+import threading
 import time
 from pymavlink import mavutil
 
@@ -34,6 +35,43 @@ class MAVLinkClient:
         self._last_heartbeat = 0.0
         self.master = None
 
+        # Debug: callback(t_arrival, yaw_deg, yawspeed_deg_s, fc_time_ms) và ClockSync (metrics.py)
+        self.on_attitude = None
+        self.clock_sync = None
+        self._reader = None
+        self._stop_reader = threading.Event()
+        self._sim_yaw = 0.0
+        self._last_timesync = 0.0
+
+    def _start_reader(self):
+        """Luồng nền đọc ATTITUDE & TIMESYNC phục vụ đo đáp ứng/đồng bộ đồng hồ."""
+        if self.on_attitude is None or self.master is None:
+            return
+        # Yêu cầu ATTITUDE 30 Hz (MAV_CMD_SET_MESSAGE_INTERVAL = 511, msg id ATTITUDE = 30)
+        self.master.mav.command_long_send(
+            self.master.target_system, self.master.target_component,
+            511, 0, 30, int(1e6 / 30), 0, 0, 0, 0, 0,
+        )
+        self._reader = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader.start()
+
+    def _reader_loop(self):
+        while not self._stop_reader.is_set() and self.master is not None:
+            try:
+                msg = self.master.recv_match(type=["ATTITUDE", "TIMESYNC"], blocking=True, timeout=0.1)
+            except Exception:
+                continue
+            if msg is None:
+                continue
+            now = time.monotonic()
+            if msg.get_type() == "ATTITUDE":
+                self.on_attitude(
+                    now, math.degrees(msg.yaw), math.degrees(msg.yawspeed), float(msg.time_boot_ms)
+                )
+            elif msg.get_type() == "TIMESYNC" and self.clock_sync is not None:
+                if msg.tc1 != 0 and msg.ts1 != 0:  # phản hồi cho yêu cầu của mình
+                    self.clock_sync.update(msg.ts1, msg.tc1, time.monotonic_ns())
+
     def connect(self):
         """Thiết lập kết nối MAVLink và đợi Heartbeat từ ArduPilot / Pixhawk 6C."""
         if self.dry_run:
@@ -58,12 +96,16 @@ class MAVLinkClient:
             f"[*] [MAVLinkClient] Đã kết nối thành công "
             f"(system={self.master.target_system}, component={self.master.target_component})!"
         )
+        self._start_reader()
 
     def send_heartbeat_if_needed(self):
         """Gửi heartbeat định kỳ (1 Hz) từ Raspberry Pi 5 / PC tới Pixhawk 6C."""
         if self.dry_run or self.master is None:
             return
         now = time.monotonic()
+        if self.clock_sync is not None and now - self._last_timesync >= 1.0:
+            self.master.mav.timesync_send(0, time.monotonic_ns())  # tc1=0: yêu cầu, ts1=ns của Pi
+            self._last_timesync = now
         if now - self._last_heartbeat >= 1.0:
             self.master.mav.heartbeat_send(
                 mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
@@ -74,14 +116,25 @@ class MAVLinkClient:
             )
             self._last_heartbeat = now
 
-    def send_control_command(self, cmd: ControlCommand):
+    def _simulate_attitude(self, yaw_rate_cmd: float, delay_s: float = 0.08):
+        """Dry-run: giả lập đáp ứng bậc 1 của drone (trễ 80ms, hệ số 0.8) để test đo đáp ứng."""
+        def _emit():
+            yawspeed = 0.8 * yaw_rate_cmd
+            self._sim_yaw += yawspeed * 0.05
+            self.on_attitude(time.monotonic(), self._sim_yaw, yawspeed, None)
+        threading.Timer(delay_s, _emit).start()
+
+    def send_control_command(self, cmd: ControlCommand) -> float:
         """
         Gửi lệnh vận tốc thân (vx, vy, vz) và tốc độ góc (yaw_rate) tới ArduPilot (chế độ GUIDED).
         - vx (m/s): Tiến (+) / Lùi (-)
         - yaw_rate (deg/s): Quay phải CW (+) / Quay trái CCW (-)
+        Trả về thời điểm gửi (time.monotonic()) để đo độ trễ.
         """
         if self.dry_run or self.master is None:
-            return
+            if self.dry_run and self.on_attitude is not None:
+                self._simulate_attitude(cmd.yaw_rate)
+            return time.monotonic()
 
         time_boot_ms = int((time.monotonic() - self._start_time) * 1000) & 0xFFFFFFFF
         yaw_rate_rad_s = math.radians(cmd.yaw_rate)
@@ -98,6 +151,7 @@ class MAVLinkClient:
             0.0,                     # yaw (bỏ qua)
             yaw_rate_rad_s,          # yaw_rate (rad/s)
         )
+        return time.monotonic()
 
     def stop_drone(self):
         """Gửi lệnh dừng Hover (vx=0, vy=0, vz=0, yaw_rate=0) lặp 3 lần để chống rớt gói tin."""
@@ -110,6 +164,9 @@ class MAVLinkClient:
     def close(self):
         """Gửi lệnh dừng drone và đóng cổng kết nối MAVLink."""
         self.stop_drone()
+        self._stop_reader.set()
+        if self._reader is not None:
+            self._reader.join(timeout=0.5)
         if self.master is not None:
             self.master.close()
             self.master = None

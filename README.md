@@ -70,3 +70,25 @@ python3 src/main_tracker.py --mode real --mavlink /dev/ttyAMA0 --baud 921600 --i
 | :--- | :--- |
 | **Click Chuột Trái** vào người | Chọn khóa mục tiêu và tự động bay bám theo (Yaw + Tiến/Lùi) |
 | Phím **`Q`** | Dừng drone (Hover) và thoát chương trình |
+| Phím **`D`** | Bật/tắt panel debug (khi chạy với `--debug`) |
+
+---
+
+## 5. Debug & Đánh giá Hệ thống (`--debug`)
+
+```bash
+python3 src/main_tracker.py --mode sim --debug            # HUD + terminal + CSV + báo cáo khi thoát
+python3 src/main_tracker.py --mode real --debug --hfov 66 # Raspberry Pi 5
+python3 src/main_tracker.py --mode mock --headless --debug --dry-run-mavlink  # test không cần SITL
+```
+Kết quả lưu ở `src/debug_metrics/<timestamp>/`: `frames.csv` (từng khung), `steps.csv` (từng bước yaw), `report.txt` (mean/P50/P95/max).
+
+| Chỉ số | Định nghĩa |
+| :--- | :--- |
+| Infer FPS / Loop FPS | 1/mean(infer) và số khung xử lý/giây (cửa sổ trượt) |
+| Capture→bbox | `t_infer_end − t_capture` (real: `SensorTimestamp` Picamera2; sim/mock: thời điểm nhận ảnh) |
+| Mất track / Nghi đổi ID | ID khóa biến mất; ID mới có IoU≥0.3 với bbox cuối xuất hiện trong ≤10 khung (heuristic, không có ground truth) |
+| Rise / Settling / Overshoot yaw | Bước sai số `abs(error_x)≥60px` → về deadband; overshoot = vọt ngược dấu / sai số ban đầu |
+| Cmd→đáp ứng, E2E | Từ lúc gửi lệnh yaw đổi đột ngột (≥5°/s) đến khi `ATTITUDE.yawspeed` đạt ≥ max(2°/s, 20% lệnh); E2E tính từ `t_capture`. Đồng hồ Pixhawk đồng bộ qua MAVLink `TIMESYNC` |
+
+Kiểm thử: `python3 src/metrics.py`

@@ -23,7 +23,7 @@ class TelemetryStats:
     lost_timeout_s: float = 2.0
     yaw_rate_deg_s: float = 0.0
     vx_m_s: float = 0.0
-
+    debug_lines: Optional[list] = None  # Các dòng thông số debug (từ metrics.DebugMetrics)
 
 class TrackingVisualizer:
     """
@@ -176,6 +176,18 @@ class TrackingVisualizer:
                 (0, 255, 0) if i in (0, 3, 4) else (230, 230, 230),
                 1,
             )
+
+        # 2b. Panel debug bên phải (khi bật --debug)
+        if stats.debug_lines:
+            dw = 290
+            dx = self.frame_width - dw - 8
+            dh = 8 + 17 * len(stats.debug_lines)
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (dx, panel_y), (dx + dw, panel_y + dh), (15, 15, 15), -1)
+            cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
+            for i, line in enumerate(stats.debug_lines):
+                cv2.putText(frame, line, (dx + 6, panel_y + 16 + i * 17),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 220, 255), 1)
 
         # 3. Thanh hướng dẫn tối giản dưới đáy
         cv2.rectangle(frame, (0, self.frame_height - 22), (self.frame_width, self.frame_height), (20, 20, 20), -1)

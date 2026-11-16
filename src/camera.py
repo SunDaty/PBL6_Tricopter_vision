@@ -1,6 +1,7 @@
 # src/camera.py
 import argparse
 import threading
+import time
 from typing import Optional
 import cv2
 import numpy as np
@@ -8,6 +9,8 @@ import numpy as np
 
 class BaseCamera:
     """Giao diện chuẩn cho mọi nguồn Camera (Gazebo Sim, Raspberry Pi Camera v3, Mock)."""
+    last_capture_time: Optional[float] = None  # monotonic (s) lúc ảnh được chụp/nhận
+
     def start(self):
         pass
 
@@ -30,6 +33,7 @@ class GazeboCamera(BaseCamera):
         self._lock = threading.Lock()
         self._latest_frame: Optional[np.ndarray] = None
         self._has_new_frame = False
+        self._latest_ts: Optional[float] = None
         self._gz_node = None
 
     def start(self):
@@ -56,6 +60,7 @@ class GazeboCamera(BaseCamera):
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
         with self._lock:
             self._latest_frame = frame_bgr
+            self._latest_ts = time.monotonic()
             self._has_new_frame = True
 
     def read_frame(self) -> Optional[np.ndarray]:
@@ -63,6 +68,7 @@ class GazeboCamera(BaseCamera):
             if not self._has_new_frame or self._latest_frame is None:
                 return None
             frame = self._latest_frame.copy()
+            self.last_capture_time = self._latest_ts
             self._has_new_frame = False
         if (frame.shape[1], frame.shape[0]) != (self.width, self.height):
             frame = cv2.resize(frame, (self.width, self.height))
@@ -108,7 +114,23 @@ class PiCameraV3(BaseCamera):
     def read_frame(self) -> Optional[np.ndarray]:
         if self._picam2 is None:
             return None
-        frame = self._picam2.capture_array("main")
+        request = self._picam2.capture_request()
+        try:
+            frame = request.make_array("main")
+            ts_ns = request.get_metadata().get("SensorTimestamp")
+        finally:
+            request.release()
+        now = time.monotonic()
+        self.last_capture_time = now
+        if ts_ns is not None:
+            # SensorTimestamp theo CLOCK_BOOTTIME -> quy về monotonic
+            try:
+                off = time.monotonic_ns() - time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+                cap = (ts_ns + off) / 1e9
+                if 0.0 <= now - cap < 1.0:
+                    self.last_capture_time = cap
+            except Exception:
+                pass
         if frame is None:
             return None
         if (frame.shape[1], frame.shape[0]) != (self.width, self.height):
@@ -134,6 +156,7 @@ class MockCamera(BaseCamera):
 
     def read_frame(self) -> Optional[np.ndarray]:
         frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        self.last_capture_time = time.monotonic()
         cx = int(self.width / 2 + 120 * np.sin(self._step * 0.1))
         self._step += 1
         cv2.rectangle(frame, (cx - 40, 140), (cx + 40, 360), (200, 200, 200), -1)
