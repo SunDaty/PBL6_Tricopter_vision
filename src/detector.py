@@ -48,8 +48,8 @@ class HumanDetector:
         tracker_config: str = "bytetrack.yaml",
     ):
         if model_path is None:
-            model_path = str(Path(__file__).resolve().parent.parent / "models" / "yolov8n.pt")
-        self.model = YOLO(model_path)
+            model_path = str(Path(__file__).resolve().parent.parent / "models" / "yolov8n_ncnn_model")
+        self.model = YOLO(model_path, task="detect")
         self.conf_thresh = conf_thresh
         self.imgsz = imgsz
         self.device = device

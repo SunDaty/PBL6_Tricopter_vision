@@ -60,7 +60,7 @@ class DroneTrackerApp:
         self.mavlink.connect()
 
         # 2. Khởi tạo Detector (YOLOv8n + ByteTrack), TargetTracker & Visualizer
-        model_path = Path(__file__).resolve().parent.parent / "models" / "yolov8n.pt"
+        model_path = Path(__file__).resolve().parent.parent / "models" / "yolov8n_ncnn_model"
         self.detector = HumanDetector(model_path=str(model_path), imgsz=imgsz)
         self.tracker = TargetTracker(
             frame_width=640,
