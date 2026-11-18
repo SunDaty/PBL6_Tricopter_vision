@@ -1,94 +1,90 @@
-# Tricopter Person Detection & Tracking (Gazebo SITL & Raspberry Pi 5 + Pixhawk 6C)
+# Tricopter Person Detection & Tracking (Raspberry Pi 5 + Pixhawk 6C & Gazebo SITL)
 
-Hệ thống **nhận diện và bám theo mục tiêu (con người)** sử dụng **YOLOv8n + ByteTrack** và **ArduPilot**, thiết kế tinh gọn theo kiến trúc module hóa để chuyển đổi trực tiếp từ **Gazebo SITL** sang **Raspberry Pi 5 (Camera Module v3) + Pixhawk 6C**.
+Hệ thống **nhận diện và bám theo mục tiêu (con người)** thời gian thực sử dụng **YOLOv8n NCNN + ByteTrack** và **ArduPilot/Pixhawk 6C**, tổ chức theo kiến trúc module phẳng gọn nhẹ trong `src/` kết hợp cấu hình YAML trong `config/` và Web Dashboard giám sát qua trình duyệt.
 
 ---
 
-## 1. Cấu trúc Module Tinh Gọn (6 Module Độc lập)
+## 1. Cấu trúc Dự án
 
 ```text
 pbl6_tricopter_vision/
+├── main.py                      # Điểm chạy chính (python3 main.py --profile raspberry_pi | simulation | mock)
+├── config/
+│   ├── common.yaml              # Tham số dùng chung (khung hình, detector, PID, tracker)
+│   ├── raspberry_pi.yaml        # Cấu hình RPi 5 (/dev/ttyAMA0 @ 921600, PiCam v3 20fps, Web port 5000)
+│   ├── simulation.yaml          # Cấu hình Gazebo + ArduPilot SITL (udpin:0.0.0.0:14550)
+│   └── mock.yaml                # Cấu hình kiểm thử nhanh không cần phần cứng
 ├── models/
-│   └── yolov8n.pt              # Trọng số mô hình YOLOv8 Nano
+│   └── yolov8n_ncnn_model/      # Trọng số YOLOv8n NCNN (model.ncnn.param, model.ncnn.bin)
 ├── src/
-│   ├── controller.py           # [Module 1] Bộ điều khiển PID/PD có Soft Deadband & ControlCommand
-│   ├── camera.py               # [Module 2] Trừu tượng hóa Camera (GazeboCamera & RPi5 PiCameraV3)
-│   ├── mavlink_client.py       # [Module 3] Giao tiếp MAVLink (SITL UDP & Pixhawk 6C UART)
-│   ├── detector.py             # [Module 4] Nhận diện & định danh người (YOLOv8n + ByteTrack)
-│   ├── tracker.py              # [Module 5] Chọn mục tiêu (Click chuột) + Điều khiển Yaw & Tiến/Lùi
-│   ├── visualizer.py           # [Module 6] Vẽ HUD trực quan & xuất log Telemetry
-│   └── main_tracker.py         # Chương trình điều phối chính (--mode sim | --mode real)
-├── requirements.txt            # Các thư viện Python phụ thuộc
-└── README.md                   # Tài liệu hướng dẫn
+│   ├── config_loader.py         # Nạp & gộp đệ quy common.yaml + profile yaml + tham số CLI
+│   ├── controller.py            # Bộ điều khiển PID/PD có Soft Deadband & ControlCommand
+│   ├── camera.py                # Nguồn Camera (PiCameraV3, GazeboCamera, MockCamera)
+│   ├── mavlink_client.py        # Giao tiếp MAVLink (guided_vel, guided_nogps, rc_override)
+│   ├── detector.py              # Nhận diện & định danh người (YOLOv8n NCNN + ByteTrack)
+│   ├── tracker.py               # Khóa mục tiêu (Click hoặc Auto-lock) + Điều khiển Yaw & Vx
+│   ├── visualizer.py            # Vẽ HUD & xuất log Telemetry
+│   ├── web_server.py            # Flask MJPEG Stream (chống sụt áp + Click chọn mục tiêu trên Web)
+│   ├── metrics.py               # Đo đạc FPS, độ trễ E2E, overshoot yaw, xuất CSV/report
+│   └── main_tracker.py          # Vòng lặp điều phối chính (DroneTrackerApp)
+├── logs/                        # Lưu báo cáo & CSV debug (<timestamp>/frames.csv, steps.csv, report.txt)
+└── requirements.txt
 ```
 
 ---
 
-## 2. Cơ chế Điều khiển Bám Mục Tiêu (`src/tracker.py`)
-
-1. **Chọn mục tiêu trực tiếp bằng Click Chuột Trái**:
-   * Khi chưa chọn mục tiêu, drone đứng yên giữ vị trí (`Hover`: `vx = 0`, `yaw_rate = 0`).
-   * Khi **Click chuột trái** vào một người trên cửa sổ Camera, hệ thống khóa `track_id` của người đó, đồng thời tự động chốt chiều cao khung bao hiện tại làm mốc chuẩn `ref_height_px` (`vx = 0.0 m/s`, không bị tự trôi).
-2. **Điều khiển góc hướng Yaw (`yaw_rate`)**:
-   * Giữ mục tiêu tại tâm ngang khung hình với vùng chết mềm `±15px`.
-3. **Điều khiển khoảng cách Tiến/Lùi (`vx`) theo Tỉ lệ Chiều cao Chuẩn hóa**:
-   * Sử dụng sai số tỉ lệ chuẩn hóa: `error_ratio = (ref_height_px - current_h) / ref_height_px` kèm vùng chết mềm `±8%` (`dist_deadband_ratio = 0.08`), giúp độ nhạy phản ứng nhất quán ở mọi khoảng cách.
-   * **Người đi ra xa** (`current_h < 0.92 * ref_height_px`) $\rightarrow$ **`vx > 0` (Drone tiến theo)**.
-   * **Người tiến lại gần** (`current_h > 1.08 * ref_height_px`) $\rightarrow$ **`vx < 0` (Drone lùi lại)**.
-   * **Mất dấu quá `2.0s`** (`lost_timeout`) $\rightarrow$ Tự động hủy khóa và dừng Hover an toàn.
-
----
-
-## 3. Kiểm thử Độc lập Từng Module
+## 2. Kiểm thử Độc lập Từng Module
 
 ```bash
+source /home/dat/drone_tracking/drone_env/bin/activate
+cd /home/dat/drone_tracking/pbl6_tricopter_vision
+
+python3 src/config_loader.py
+python3 src/web_server.py
 python3 src/controller.py
 python3 src/camera.py --test-mock
+python3 src/camera.py --mode real
 python3 src/mavlink_client.py --test-mock
 python3 src/detector.py
 python3 src/tracker.py
 python3 src/visualizer.py
+python3 src/metrics.py
 ```
 
 ---
 
-## 4. Hướng dẫn Vận hành
+## 3. Hướng dẫn Vận hành
 
-### 4.1. Chạy trong Mô phỏng Gazebo + ArduPilot SITL
+### 3.1. Chạy trên Raspberry Pi 5 (Camera Module v3 + Pixhawk 6C)
 ```bash
-python3 src/main_tracker.py --mode sim
+python3 main.py --profile raspberry_pi
+```
+* Mặc định kết nối UART `/dev/ttyAMA0` ở tốc độ `921600`, Camera v3 `640x480 @ 20fps` (xoay 180°), bật Web Stream tại `http://<IP_Raspberry_Pi>:5000`.
+* Có thể chuyển phương thức điều khiển ngay qua CLI nếu cần:
+  ```bash
+  python3 main.py --profile raspberry_pi --control-method rc_override
+  python3 main.py --profile raspberry_pi --control-method guided_nogps
+  ```
+
+### 3.2. Chạy trong Mô phỏng Gazebo + ArduPilot SITL
+```bash
+python3 main.py --profile simulation
 ```
 
-### 4.2. Chạy trên Thực tế: Raspberry Pi 5 (Camera v3) + Pixhawk 6C
+### 3.3. Chạy thử không cần phần cứng (Mock Camera + Dry-run MAVLink + Web Stream)
 ```bash
-python3 src/main_tracker.py --mode real --mavlink /dev/ttyAMA0 --baud 921600 --imgsz 320
+python3 main.py --profile mock --debug
 ```
 
-### 4.3. Thao tác trên Cửa sổ Camera
-
-| Thao tác | Chức năng |
-| :--- | :--- |
-| **Click Chuột Trái** vào người | Chọn khóa mục tiêu và tự động bay bám theo (Yaw + Tiến/Lùi) |
-| Phím **`Q`** | Dừng drone (Hover) và thoát chương trình |
-| Phím **`D`** | Bật/tắt panel debug (khi chạy với `--debug`) |
+### 3.4. Điều khiển trên Web Dashboard & Cửa sổ OpenCV
+* **Web Dashboard (`http://<IP>:5000`)**: Chạm/click trực tiếp lên người trong video để khóa mục tiêu hoặc nhấn **Reset / Hover** để hủy khóa. Ảnh JPEG chỉ được nén khi có trình duyệt đang kết nối để tiết kiệm CPU và tránh sụt áp trên Raspberry Pi 5.
+* **Cửa sổ OpenCV (khi chạy `--gui` hoặc profile `simulation`)**: Click chuột trái vào người để khóa mục tiêu, nhấn `D` để bật/tắt panel debug, nhấn `Q` để dừng Hover và thoát.
 
 ---
 
-## 5. Debug & Đánh giá Hệ thống (`--debug`)
+## 4. Debug & Đánh giá Hệ thống (`--debug`)
 
 ```bash
-python3 src/main_tracker.py --mode sim --debug            # HUD + terminal + CSV + báo cáo khi thoát
-python3 src/main_tracker.py --mode real --debug --hfov 66 # Raspberry Pi 5
-python3 src/main_tracker.py --mode mock --headless --debug --dry-run-mavlink  # test không cần SITL
+python3 main.py --profile raspberry_pi --debug
 ```
-Kết quả lưu ở `src/debug_metrics/<timestamp>/`: `frames.csv` (từng khung), `steps.csv` (từng bước yaw), `report.txt` (mean/P50/P95/max).
-
-| Chỉ số | Định nghĩa |
-| :--- | :--- |
-| Infer FPS / Loop FPS | 1/mean(infer) và số khung xử lý/giây (cửa sổ trượt) |
-| Capture→bbox | `t_infer_end − t_capture` (real: `SensorTimestamp` Picamera2; sim/mock: thời điểm nhận ảnh) |
-| Mất track / Nghi đổi ID | ID khóa biến mất; ID mới có IoU≥0.3 với bbox cuối xuất hiện trong ≤10 khung (heuristic, không có ground truth) |
-| Rise / Settling / Overshoot yaw | Bước sai số `abs(error_x)≥60px` → về deadband; overshoot = vọt ngược dấu / sai số ban đầu |
-| Cmd→đáp ứng, E2E | Từ lúc gửi lệnh yaw đổi đột ngột (≥5°/s) đến khi `ATTITUDE.yawspeed` đạt ≥ max(2°/s, 20% lệnh); E2E tính từ `t_capture`. Đồng hồ Pixhawk đồng bộ qua MAVLink `TIMESYNC` |
-
-Kiểm thử: `python3 src/metrics.py`
+Kết quả được lưu vào `logs/<timestamp>/` gồm `frames.csv`, `steps.csv` và `report.txt`.

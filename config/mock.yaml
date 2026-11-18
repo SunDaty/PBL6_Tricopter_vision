@@ -1,0 +1,23 @@
+# Cấu hình kiểm thử nhanh không cần phần cứng (MockCamera + Dry-Run MAVLink)
+mode: mock
+
+camera:
+  fps: 20
+  rotate_180: false
+
+mavlink:
+  conn_str: udpin:0.0.0.0:14550
+  baud: 921600
+  control_method: guided_vel
+  dry_run: true
+
+web:
+  enabled: true
+  host: 0.0.0.0
+  port: 5000
+  jpeg_quality: 60
+
+loop:
+  target_fps: 15.0
+  headless: true
+  auto_lock: true

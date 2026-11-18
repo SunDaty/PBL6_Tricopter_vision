@@ -37,6 +37,7 @@ class TargetTracker:
         max_vx_decel: float = 2.5,
         height_ema_alpha: float = 0.55,
         lost_timeout: float = 2.0,
+        auto_lock: bool = False,
     ):
         self.frame_width = frame_width
         self.frame_height = frame_height
@@ -51,6 +52,7 @@ class TargetTracker:
         self.max_vx_decel = max_vx_decel
         self.height_ema_alpha = height_ema_alpha
         self.lost_timeout = lost_timeout
+        self.auto_lock = auto_lock
 
         # Trạng thái mục tiêu đang khóa
         self.locked_id: Optional[int] = None
@@ -218,7 +220,13 @@ class TargetTracker:
         current_time = now if now is not None else time.monotonic()
 
         if self.locked_id is None:
-            return ControlCommand(), None
+            if self.auto_lock and detections:
+                chosen = min(detections, key=lambda d: d.track_id)
+                self.locked_id = chosen.track_id
+                self.last_seen_time = current_time
+                self._calibrate_reference(chosen, now=current_time)
+            else:
+                return ControlCommand(), None
 
         target = next((d for d in detections if d.track_id == self.locked_id), None)
         if target is None:

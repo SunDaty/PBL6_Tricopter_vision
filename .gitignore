@@ -1,6 +1,6 @@
 __pycache__/
 *.py[cod]
-
+logs/
 debug_logs/
 
 .env

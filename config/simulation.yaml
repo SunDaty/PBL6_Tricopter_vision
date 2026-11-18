@@ -1,0 +1,23 @@
+# Cấu hình mô phỏng Gazebo + ArduPilot SITL
+mode: sim
+
+camera:
+  topic: /camera/image_raw
+  fps: 30
+  rotate_180: false
+
+mavlink:
+  conn_str: udpin:0.0.0.0:14550
+  baud: 921600
+  control_method: guided_vel
+
+web:
+  enabled: false
+  host: 0.0.0.0
+  port: 5000
+  jpeg_quality: 75
+
+loop:
+  target_fps: 30.0
+  headless: false
+  auto_lock: false

@@ -80,10 +80,19 @@ class PiCameraV3(BaseCamera):
     Nguồn nhận ảnh trực tiếp từ Raspberry Pi Camera Module v3 (IMX708) trên Raspberry Pi 5
     sử dụng thư viện Picamera2 (libcamera).
     """
-    def __init__(self, width: int = 640, height: int = 480, fps: int = 30):
+    def __init__(
+        self,
+        width: int = 640,
+        height: int = 480,
+        fps: int = 20,
+        buffer_count: int = 2,
+        rotate_180: bool = True,
+    ):
         self.width = width
         self.height = height
         self.fps = fps
+        self.buffer_count = buffer_count
+        self.rotate_180 = rotate_180
         self._picam2 = None
 
     def start(self):
@@ -99,6 +108,7 @@ class PiCameraV3(BaseCamera):
         config = self._picam2.create_video_configuration(
             main={"size": (self.width, self.height), "format": "RGB888"},
             controls={"FrameRate": self.fps},
+            buffer_count=self.buffer_count,
         )
         self._picam2.configure(config)
         self._picam2.start()
@@ -109,7 +119,10 @@ class PiCameraV3(BaseCamera):
         except Exception:
             pass
 
-        print(f"[*] [PiCameraV3] Đã khởi động Camera Module v3 ({self.width}x{self.height} @ {self.fps}fps)")
+        print(
+            f"[*] [PiCameraV3] Đã khởi động Camera Module v3 "
+            f"({self.width}x{self.height} @ {self.fps}fps, rotate_180={self.rotate_180})"
+        )
 
     def read_frame(self) -> Optional[np.ndarray]:
         if self._picam2 is None:
@@ -135,6 +148,8 @@ class PiCameraV3(BaseCamera):
             return None
         if (frame.shape[1], frame.shape[0]) != (self.width, self.height):
             frame = cv2.resize(frame, (self.width, self.height))
+        if self.rotate_180:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
         return np.ascontiguousarray(frame)
 
     def stop(self):
@@ -164,17 +179,26 @@ class MockCamera(BaseCamera):
 
 
 def create_camera(
-    mode: str = "sim",
+    mode: str = "real",
     image_topic: str = "/camera/image_raw",
     width: int = 640,
     height: int = 480,
+    fps: int = 20,
+    buffer_count: int = 2,
+    rotate_180: bool = True,
 ) -> BaseCamera:
     """Khởi tạo nguồn camera theo chế độ ('sim', 'real', hoặc 'mock')."""
     mode = mode.lower()
     if mode == "sim":
         return GazeboCamera(topic=image_topic, width=width, height=height)
     elif mode == "real":
-        return PiCameraV3(width=width, height=height)
+        return PiCameraV3(
+            width=width,
+            height=height,
+            fps=fps,
+            buffer_count=buffer_count,
+            rotate_180=rotate_180,
+        )
     elif mode == "mock":
         return MockCamera(width=width, height=height)
     else:
@@ -183,14 +207,21 @@ def create_camera(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Kiểm thử độc lập Module Camera")
-    parser.add_argument("--mode", choices=["sim", "real", "mock"], default="mock")
+    parser.add_argument("--mode", choices=["sim", "real", "mock"], default="real")
     parser.add_argument("--topic", default="/camera/image_raw")
+    parser.add_argument("--fps", type=int, default=20)
+    parser.add_argument("--no-rotate", action="store_true", help="Không xoay ảnh 180 độ cho PiCameraV3")
     parser.add_argument("--test-mock", action="store_true", help="Chạy tự kiểm thử nhanh với MockCamera")
     args = parser.parse_args()
 
     print("=== Kiểm thử độc lập Module 2: camera.py ===")
     cam_mode = "mock" if args.test_mock else args.mode
-    cam = create_camera(mode=cam_mode, image_topic=args.topic)
+    cam = create_camera(
+        mode=cam_mode,
+        image_topic=args.topic,
+        fps=args.fps,
+        rotate_180=not args.no_rotate,
+    )
     cam.start()
     frame = cam.read_frame()
     assert frame is not None and frame.shape == (480, 640, 3)

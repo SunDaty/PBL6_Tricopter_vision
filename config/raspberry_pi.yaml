@@ -1,0 +1,23 @@
+# Cấu hình thực tế trên Raspberry Pi 5 + Camera Module v3 + Pixhawk 6C
+mode: real
+
+camera:
+  fps: 20
+  buffer_count: 2
+  rotate_180: true
+
+mavlink:
+  conn_str: /dev/ttyAMA0
+  baud: 921600
+  control_method: guided_vel   # Có thể đổi sang guided_nogps hoặc rc_override
+
+web:
+  enabled: true
+  host: 0.0.0.0
+  port: 5000
+  jpeg_quality: 60
+
+loop:
+  target_fps: 15.0
+  headless: true
+  auto_lock: true

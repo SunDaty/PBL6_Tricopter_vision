@@ -1,0 +1,46 @@
+# Cấu hình dùng chung cho mọi chế độ (Raspberry Pi 5, Gazebo Simulation, Mock)
+frame:
+  width: 640
+  height: 480
+  hfov: 66.0
+
+detector:
+  model_dir: models/yolov8n_ncnn_model
+  imgsz: 640
+  conf_thresh: 0.45
+  nms_thresh: 0.45
+  ncnn_threads: 2
+
+tracker:
+  yaw_kp: 0.08
+  yaw_kd: 0.01
+  yaw_deadband_px: 15.0
+  max_yaw_rate: 25.0
+  dist_kp: 1.6
+  dist_deadband_ratio: 0.05
+  min_vx: 0 #0.15
+  max_vx: 0 #1.2
+  max_vx_accel: 1.8
+  max_vx_decel: 2.5
+  height_ema_alpha: 0.55
+  lost_timeout: 2.0
+
+mavlink:
+  heartbeat_timeout: 15.0
+  control_method: guided_vel   # guided_vel | guided_nogps | rc_override
+  nogps_thrust: 0.0
+  rc_yaw_center: 1500
+  rc_yaw_range: 150
+  dry_run: false
+
+web:
+  enabled: false
+  host: 0.0.0.0
+  port: 5000
+  jpeg_quality: 60
+
+loop:
+  target_fps: 15.0
+  headless: false
+  auto_lock: false
+  terminal_log_interval: 0.5
