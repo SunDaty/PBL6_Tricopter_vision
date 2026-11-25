@@ -4,18 +4,31 @@ frame:
   height: 480
   hfov: 66.0
 
+camera:
+  ae_exposure_mode: short      # short | normal (ưu tiên màn trập nhanh giảm motion blur)
+  af_mode: manual              # manual | continuous (cố định nét tránh AF hunting)
+  lens_position: 0.3           # diopter (~3.3m, DOF sâu từ ~1.5m tới vô cực)
+
 detector:
   model_dir: models/yolov8n_ncnn_model
   imgsz: 640
-  conf_thresh: 0.45
+  conf_thresh: 0.20            # hạ từ 0.45 để bật tầng 2 ByteTrack nối track khi ảnh hơi mờ
+  track_activation_threshold: 0.45  # chỉ conf >= 0.55 mới khởi tạo track mới
+  lost_track_buffer: 30
+  minimum_matching_threshold: 0.85
+  ego_motion_comp: true
   nms_thresh: 0.45
   ncnn_threads: 2
 
 tracker:
-  yaw_kp: 0.08
-  yaw_kd: 0.01
-  yaw_deadband_px: 15.0
-  max_yaw_rate: 25.0
+  yaw_kp: 0.08                 # giữ nguyên khóa cũ (deg/s trên mỗi pixel tương đương)
+  yaw_kd: 0.0                  # giữ nguyên khóa cũ (đặt 0 tránh khuếch đại nhiễu bbox)
+  yaw_deadband_px: 15.0        # giữ nguyên khóa cũ (ngưỡng vào vùng chết)
+  yaw_deadband_exit_px: 26.0   # ngưỡng thoát vùng chết (Hysteresis Deadband)
+  max_yaw_rate: 20.0           # giữ nguyên khóa cũ (deg/s)
+  max_yaw_accel: 60.0          # giới hạn gia tốc lệnh yaw (deg/s^2)
+  latency_comp: true
+  coast_timeout: 0.6
   dist_kp: 1.6
   dist_deadband_ratio: 0.05
   min_vx: 0 #0.15
@@ -23,7 +36,18 @@ tracker:
   max_vx_accel: 1.8
   max_vx_decel: 2.5
   height_ema_alpha: 0.55
-  lost_timeout: 2.0
+  lost_timeout: 3.0
+  reacquire:
+    enabled: true
+    max_bearing_deg: 12.0
+    height_ratio: [0.65, 1.5]
+    use_color_hist: true
+    hist_min_corr: 0.45
+    single_person_fallback: true
+
+telemetry:
+  enabled: true
+  attitude_hz: 50
 
 mavlink:
   heartbeat_timeout: 15.0
@@ -43,4 +67,5 @@ loop:
   target_fps: 15.0
   headless: false
   auto_lock: false
-  terminal_log_interval: 0.5
+  hud_mode: minimal            # minimal | full | off
+  terminal_log_interval: 0.0   # 0 = tắt log định kỳ khi đang bay

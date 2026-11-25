@@ -8,6 +8,8 @@ import ncnn
 import numpy as np
 import supervision as sv
 
+from ego_motion import BearingProjector
+
 # Giới hạn số luồng để tránh tranh chấp CPU và chống sụt áp (Brownout) trên Raspberry Pi 5
 cv2.setNumThreads(1)
 DEFAULT_NCNN_THREADS = 2
@@ -87,16 +89,24 @@ class HumanDetector:
     def __init__(
         self,
         model_path: Optional[str] = None,
-        conf_thresh: float = 0.45,
+        conf_thresh: float = 0.20,
         nms_thresh: float = 0.45,
         imgsz: int = 640,
         num_threads: int = DEFAULT_NCNN_THREADS,
+        track_activation_threshold: float = 0.45,
+        lost_track_buffer: int = 30,
+        minimum_matching_threshold: float = 0.85,
+        frame_width: int = 640,
+        hfov_deg: float = 66.0,
     ):
         self.param_path, self.bin_path = _resolve_ncnn_files(model_path)
         self.conf_thresh = conf_thresh
         self.nms_thresh = nms_thresh
         self.imgsz = imgsz
         self.num_threads = num_threads
+        self.track_activation_threshold = float(track_activation_threshold)
+        self.lost_track_buffer = int(lost_track_buffer)
+        self.minimum_matching_threshold = float(minimum_matching_threshold)
 
         with open(self.param_path, "r", encoding="utf-8", errors="ignore") as f:
             first_line = f.readline().strip()
@@ -131,12 +141,20 @@ class HumanDetector:
 
         self._anchor_points, self._stride_tensor = _make_anchors(self.imgsz)
         self._dfl_proj = np.arange(REG_MAX, dtype=np.float32)
-        self.tracker = sv.ByteTrack()
+        self.projector = BearingProjector(frame_width=frame_width, hfov_deg=hfov_deg)
+        # Giữ frame_rate=30 (mặc định supervision) để lost_track_buffer ứng đúng số frame
+        self.tracker = sv.ByteTrack(
+            track_activation_threshold=self.track_activation_threshold,
+            lost_track_buffer=self.lost_track_buffer,
+            minimum_matching_threshold=self.minimum_matching_threshold,
+            frame_rate=30,
+        )
 
         print(
             f"[*] [HumanDetector] Đã nạp NCNN ({self.param_path.name}, "
             f"input='{self.input_blob}', output='{self.output_blob}', "
-            f"threads={self.num_threads}, imgsz={self.imgsz})"
+            f"threads={self.num_threads}, imgsz={self.imgsz}, "
+            f"conf={self.conf_thresh}, act={self.track_activation_threshold})"
         )
 
     def _infer_person_detections(self, frame: np.ndarray) -> sv.Detections:
@@ -239,19 +257,32 @@ class HumanDetector:
 
         return sv.Detections(xyxy=xyxy, confidence=confidences, class_id=class_ids)
 
-    def detect_and_track(self, frame: np.ndarray) -> list[DetectedPerson]:
+    def track_detections(
+        self,
+        sv_detections: sv.Detections,
+        psi: Optional[float] = None,
+    ) -> list[DetectedPerson]:
         """
-        Chạy YOLOv8n NCNN kèm ByteTrack để phát hiện người (class 0) và duy trì track_id.
-        Chỉ trả về các mục tiêu đã được ByteTrack cấp ID hợp lệ.
+        Cập nhật ByteTrack từ danh sách sv.Detections, có tùy chọn bù chuyển động quay yaw (psi rad).
         """
-        sv_detections = self._infer_person_detections(frame)
+        if psi is not None and len(sv_detections) > 0:
+            sv_detections = sv.Detections(
+                xyxy=self.projector.boxes_to_world(sv_detections.xyxy, psi),
+                confidence=sv_detections.confidence,
+                class_id=sv_detections.class_id,
+            )
+
         tracked = self.tracker.update_with_detections(sv_detections)
         if len(tracked) == 0 or tracked.tracker_id is None:
             return []
 
+        boxes = tracked.xyxy
+        if psi is not None and len(boxes) > 0:
+            boxes = self.projector.boxes_to_image(boxes, psi)
+
         detections: list[DetectedPerson] = []
-        for box, track_id, conf in zip(tracked.xyxy, tracked.tracker_id, tracked.confidence):
-            x1, y1, x2, y2 = map(int, box)
+        for box, track_id, conf in zip(boxes, tracked.tracker_id, tracked.confidence):
+            x1, y1, x2, y2 = map(int, np.round(box))
             detections.append(
                 DetectedPerson(
                     track_id=int(track_id),
@@ -260,6 +291,19 @@ class HumanDetector:
                 )
             )
         return detections
+
+    def detect_and_track(
+        self,
+        frame: np.ndarray,
+        psi: Optional[float] = None,
+    ) -> list[DetectedPerson]:
+        """
+        Chạy YOLOv8n NCNN kèm ByteTrack để phát hiện người (class 0) và duy trì track_id.
+        Nếu truyền `psi` (góc yaw unwrapped tại thời điểm chụp ảnh, rad), thực hiện bù chuyển động
+        camera trước khi cập nhật ByteTrack rồi chiếu ngược bbox về tọa độ ảnh gốc.
+        """
+        sv_detections = self._infer_person_detections(frame)
+        return self.track_detections(sv_detections, psi=psi)
 
 
 if __name__ == "__main__":

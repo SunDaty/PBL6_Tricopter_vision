@@ -79,7 +79,11 @@ class PiCameraV3(BaseCamera):
     """
     Nguồn nhận ảnh trực tiếp từ Raspberry Pi Camera Module v3 (IMX708) trên Raspberry Pi 5
     sử dụng thư viện Picamera2 (libcamera).
+    Mặc định khóa nét cố định (AF Manual) và phơi sáng tốc độ cao (AE Short) để giảm motion blur.
     """
+    _AF_MODE_MAP = {"manual": 0, "auto": 1, "continuous": 2}
+    _AE_MODE_MAP = {"normal": 0, "short": 1, "long": 2}
+
     def __init__(
         self,
         width: int = 640,
@@ -87,12 +91,18 @@ class PiCameraV3(BaseCamera):
         fps: int = 20,
         buffer_count: int = 2,
         rotate_180: bool = True,
+        ae_exposure_mode: str = "short",
+        af_mode: str = "manual",
+        lens_position: float = 0.3,
     ):
         self.width = width
         self.height = height
         self.fps = fps
         self.buffer_count = buffer_count
         self.rotate_180 = rotate_180
+        self.ae_exposure_mode = str(ae_exposure_mode).lower()
+        self.af_mode = str(af_mode).lower()
+        self.lens_position = float(lens_position)
         self._picam2 = None
 
     def start(self):
@@ -113,15 +123,32 @@ class PiCameraV3(BaseCamera):
         self._picam2.configure(config)
         self._picam2.start()
 
-        # Bật lấy nét tự động liên tục (Continuous Autofocus) trên Camera Module v3
+        # Thiết lập lấy nét (mặc định Manual + LensPosition cố định tránh AF hunting khi quay yaw)
+        af_val = self._AF_MODE_MAP.get(self.af_mode, 0)
+        af_ctrl = {"AfMode": af_val}
+        if af_val == 0:
+            af_ctrl["LensPosition"] = self.lens_position
         try:
-            self._picam2.set_controls({"AfMode": 2})
-        except Exception:
-            pass
+            self._picam2.set_controls(af_ctrl)
+        except Exception as exc:
+            print(f"[!] [PiCameraV3] Không đặt được AF controls ({af_ctrl}): {exc}")
 
+        # Thiết lập chế độ phơi sáng (mặc định Short ưu tiên màn trập nhanh giảm nhòe chuyển động)
+        ae_val = self._AE_MODE_MAP.get(self.ae_exposure_mode, 1)
+        try:
+            self._picam2.set_controls({"AeExposureMode": ae_val})
+        except Exception as exc:
+            print(f"[!] [PiCameraV3] Không đặt được AeExposureMode={ae_val}: {exc}")
+
+        af_desc = (
+            f"manual(lens={self.lens_position:.2f}D)"
+            if af_val == 0
+            else self.af_mode
+        )
         print(
             f"[*] [PiCameraV3] Đã khởi động Camera Module v3 "
-            f"({self.width}x{self.height} @ {self.fps}fps, rotate_180={self.rotate_180})"
+            f"({self.width}x{self.height} @ {self.fps}fps, rotate_180={self.rotate_180}, "
+            f"AF={af_desc}, AE={self.ae_exposure_mode})"
         )
 
     def read_frame(self) -> Optional[np.ndarray]:
@@ -186,6 +213,9 @@ def create_camera(
     fps: int = 20,
     buffer_count: int = 2,
     rotate_180: bool = True,
+    ae_exposure_mode: str = "short",
+    af_mode: str = "manual",
+    lens_position: float = 0.3,
 ) -> BaseCamera:
     """Khởi tạo nguồn camera theo chế độ ('sim', 'real', hoặc 'mock')."""
     mode = mode.lower()
@@ -198,6 +228,9 @@ def create_camera(
             fps=fps,
             buffer_count=buffer_count,
             rotate_180=rotate_180,
+            ae_exposure_mode=ae_exposure_mode,
+            af_mode=af_mode,
+            lens_position=lens_position,
         )
     elif mode == "mock":
         return MockCamera(width=width, height=height)

@@ -89,6 +89,7 @@ class IdQualityMonitor:
         self.iou_thresh = iou_thresh
         self.lock_loss = 0
         self.suspected_switches = 0
+        self.reacquire_count = 0
         self.known_ids: set[int] = set()
         self._cur_lock: Optional[int] = None
         self._last_bbox = None
@@ -96,11 +97,16 @@ class IdQualityMonitor:
         self._known_at_loss: set[int] = set()
         self._switch_flagged = False
 
-    def update(self, detections, locked_id: Optional[int]) -> bool:
+    def update(self, detections, locked_id: Optional[int], reacq_flag: bool = False) -> bool:
         """Trả True nếu khung này bị đánh dấu nghi đổi ID."""
         flag = False
         ids = {d.track_id for d in detections}
-        if locked_id != self._cur_lock:  # chọn mục tiêu mới / hủy khóa
+        if reacq_flag and locked_id is not None:
+            self.reacquire_count += 1
+            self._cur_lock = locked_id
+            self._missing = 0
+            self._switch_flagged = False
+        elif locked_id != self._cur_lock:  # chọn mục tiêu mới / hủy khóa
             self._cur_lock = locked_id
             self._last_bbox, self._missing, self._switch_flagged = None, 0, False
         if locked_id is not None:
@@ -211,8 +217,11 @@ class CmdResponseTracker:
             self._pending = None
 
 
-CSV_FIELDS = ["frame", "t_capture", "infer_ms", "cap2bbox_ms", "cap2cmd_ms", "locked_id", "n_det",
-              "err_x", "yaw_cmd", "vx_cmd", "yaw_att_deg", "yawspeed_att", "id_switch_flag"]
+CSV_FIELDS = [
+    "frame", "t_capture", "infer_ms", "cap2bbox_ms", "cap2cmd_ms", "locked_id", "n_det",
+    "err_x", "yaw_cmd", "vx_cmd", "yaw_att_deg", "yawspeed_att", "id_switch_flag",
+    "state", "err_deg_now", "psi_cap_deg", "reacq_flag",
+]
 STEP_FIELDS = ["t0", "e0_px", "e0_deg", "rise_s", "settle_s", "overshoot_pct",
                "yaw_travel_deg", "yaw_overshoot_deg", "settled"]
 
@@ -234,6 +243,7 @@ class DebugMetrics:
         self._t_start = time.monotonic()
         self._last_yaw: Optional[float] = None
         self._last_yawspeed: Optional[float] = None
+        self._state_counts: dict[str, int] = {"IDLE": 0, "TRACK": 0, "COAST": 0, "SEARCH_HOLD": 0}
         self._csv_f = open(self.out_dir / "frames.csv", "w", newline="")
         self._csv = csv.DictWriter(self._csv_f, fieldnames=CSV_FIELDS)
         self._csv.writeheader()
@@ -251,9 +261,13 @@ class DebugMetrics:
             self.resp.on_attitude(t_pi, yawspeed_deg_s)
 
     def on_frame(self, frame_idx, t_capture, t_infer_start, t_infer_end, t_cmd_sent,
-                 detections, locked_id, err_x, yaw_cmd, vx_cmd):
+                 detections, locked_id, err_x, yaw_cmd, vx_cmd,
+                 state: str = "", err_deg_now: Optional[float] = None,
+                 psi_cap_deg: Optional[float] = None, reacq_flag: bool = False):
         with self._lock:
             self._frames += 1
+            if state in self._state_counts:
+                self._state_counts[state] += 1
             infer = (t_infer_end - t_infer_start) * 1000.0
             c2b = (t_infer_end - t_capture) * 1000.0
             c2c = (t_cmd_sent - t_capture) * 1000.0
@@ -262,7 +276,7 @@ class DebugMetrics:
                 self.cap2bbox.add(c2b)
                 self.cap2cmd.add(c2c)
             self._done_times.append(t_infer_end)
-            flag = self.id_mon.update(detections, locked_id)
+            flag = self.id_mon.update(detections, locked_id, reacq_flag=reacq_flag)
             self.yaw.update(t_infer_end, err_x, self._last_yaw)
             self.resp.on_command(t_cmd_sent, t_capture, yaw_cmd)
             self._csv.writerow({
@@ -273,7 +287,12 @@ class DebugMetrics:
                 "vx_cmd": f"{vx_cmd:.2f}",
                 "yaw_att_deg": "" if self._last_yaw is None else f"{self._last_yaw:.2f}",
                 "yawspeed_att": "" if self._last_yawspeed is None else f"{self._last_yawspeed:.2f}",
-                "id_switch_flag": int(flag)})
+                "id_switch_flag": int(flag),
+                "state": state,
+                "err_deg_now": "" if err_deg_now is None else f"{err_deg_now:.2f}",
+                "psi_cap_deg": "" if psi_cap_deg is None else f"{psi_cap_deg:.2f}",
+                "reacq_flag": int(reacq_flag),
+            })
 
     def fps_window(self) -> float:
         d = self._done_times
@@ -299,6 +318,15 @@ class DebugMetrics:
             lines.append(f"E2E ms: {e2e['mean']:.0f} avg / {e2e['p95']:.0f} p95 (n={e2e['n']})")
             return lines
 
+    def _state_summary_line(self) -> str:
+        active = self._state_counts["TRACK"] + self._state_counts["COAST"] + self._state_counts["SEARCH_HOLD"]
+        if active <= 0:
+            return "Trạng thái bám: chưa khóa mục tiêu"
+        tr = self._state_counts["TRACK"] / active * 100.0
+        co = self._state_counts["COAST"] / active * 100.0
+        sh = self._state_counts["SEARCH_HOLD"] / active * 100.0
+        return f"Trạng thái khi khóa ({active} khung): TRACK {tr:.1f}% | COAST {co:.1f}% | HOLD {sh:.1f}%"
+
     def report(self) -> str:
         with self._lock:
             def row(name, s):
@@ -318,7 +346,9 @@ class DebugMetrics:
                  row("E2E capture->response (ms)", self.resp.e2e.total()),
                  f"Phản hồi lệnh không bắt được (timeout): {self.resp.misses}",
                  f"Mất track ID khóa: {self.id_mon.lock_loss} | Nghi đổi ID: "
-                 f"{self.id_mon.suspected_switches} | ID duy nhất: {len(self.id_mon.known_ids)}",
+                 f"{self.id_mon.suspected_switches} | Tự bắt lại (RE-ACQ): "
+                 f"{self.id_mon.reacquire_count} | ID duy nhất: {len(self.id_mon.known_ids)}",
+                 self._state_summary_line(),
                  f"Đồng bộ đồng hồ: " + (f"OK, RTT min {self.clock_sync.rtt_ms:.2f} ms"
                                          if self.clock_sync.ready else "KHÔNG (dùng thời điểm nhận gói)"),
                  f"Số bước yaw đo được: {len(steps)}"]

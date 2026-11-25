@@ -6,6 +6,7 @@ import time
 from pymavlink import mavutil
 
 from controller import ControlCommand
+from ego_motion import YawHistory
 
 # Bitmask cho SET_POSITION_TARGET_LOCAL_NED:
 # Bỏ qua vị trí (x, y, z), gia tốc (afx, afy, afz) và góc yaw tuyệt đối.
@@ -40,6 +41,8 @@ class MAVLinkClient:
         nogps_thrust: float = 0.0,
         rc_yaw_center: int = 1500,
         rc_yaw_range: int = 150,
+        telemetry_enabled: bool = True,
+        attitude_hz: int = 50,
     ):
         method = control_method.lower()
         if method not in VALID_CONTROL_METHODS:
@@ -55,10 +58,15 @@ class MAVLinkClient:
         self.nogps_thrust = max(0.0, min(1.0, float(nogps_thrust)))
         self.rc_yaw_center = int(rc_yaw_center)
         self.rc_yaw_range = int(rc_yaw_range)
+        self.telemetry_enabled = bool(telemetry_enabled)
+        self.attitude_hz = max(1, int(attitude_hz))
 
         self._start_time = time.monotonic()
         self._last_heartbeat = 0.0
         self.master = None
+
+        # Lịch sử góc Yaw (rad, unwrapped) phục vụ bù chuyển động & bù độ trễ
+        self.yaw_history = YawHistory(keep_s=3.0)
 
         # Debug: callback(t_arrival, yaw_deg, yawspeed_deg_s, fc_time_ms) và ClockSync (metrics.py)
         self.on_attitude = None
@@ -69,13 +77,13 @@ class MAVLinkClient:
         self._last_timesync = 0.0
 
     def _start_reader(self):
-        """Luồng nền đọc ATTITUDE & TIMESYNC phục vụ đo đáp ứng/đồng bộ đồng hồ."""
-        if self.on_attitude is None or self.master is None:
+        """Luồng nền đọc ATTITUDE (50 Hz mặc định) & TIMESYNC phục vụ điều khiển bù trễ và đo đáp ứng."""
+        if self.master is None or (not self.telemetry_enabled and self.on_attitude is None):
             return
-        # Yêu cầu ATTITUDE 30 Hz (MAV_CMD_SET_MESSAGE_INTERVAL = 511, msg id ATTITUDE = 30)
+        # Yêu cầu ATTITUDE theo attitude_hz (MAV_CMD_SET_MESSAGE_INTERVAL = 511, msg id ATTITUDE = 30)
         self.master.mav.command_long_send(
             self.master.target_system, self.master.target_component,
-            511, 0, 30, int(1e6 / 30), 0, 0, 0, 0, 0,
+            511, 0, 30, int(1e6 / self.attitude_hz), 0, 0, 0, 0, 0,
         )
         self._reader = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader.start()
@@ -90,9 +98,16 @@ class MAVLinkClient:
                 continue
             now = time.monotonic()
             if msg.get_type() == "ATTITUDE":
-                self.on_attitude(
-                    now, math.degrees(msg.yaw), math.degrees(msg.yawspeed), float(msg.time_boot_ms)
-                )
+                t_sample = now
+                if self.clock_sync is not None:
+                    conv = self.clock_sync.to_pi_time(float(msg.time_boot_ms) * 1e6)
+                    if conv is not None and abs(conv - now) < 0.25:
+                        t_sample = conv
+                self.yaw_history.add(t_sample, float(msg.yaw), float(msg.yawspeed))
+                if self.on_attitude is not None:
+                    self.on_attitude(
+                        now, math.degrees(msg.yaw), math.degrees(msg.yawspeed), float(msg.time_boot_ms)
+                    )
             elif msg.get_type() == "TIMESYNC" and self.clock_sync is not None:
                 if msg.tc1 != 0 and msg.ts1 != 0:  # phản hồi cho yêu cầu của mình
                     self.clock_sync.update(msg.ts1, msg.tc1, time.monotonic_ns())
@@ -142,12 +157,19 @@ class MAVLinkClient:
             self._last_heartbeat = now
 
     def _simulate_attitude(self, yaw_rate_cmd: float, delay_s: float = 0.08):
-        """Dry-run: giả lập đáp ứng bậc 1 của drone (trễ 80ms, hệ số 0.8) để test đo đáp ứng."""
+        """Dry-run: giả lập đáp ứng bậc 1 của drone (trễ 80ms, hệ số 0.8) để test bù trễ/đo đáp ứng."""
         def _emit():
+            if self._stop_reader.is_set():
+                return
+            t_now = time.monotonic()
             yawspeed = 0.8 * yaw_rate_cmd
             self._sim_yaw += yawspeed * 0.05
-            self.on_attitude(time.monotonic(), self._sim_yaw, yawspeed, None)
-        threading.Timer(delay_s, _emit).start()
+            self.yaw_history.add(t_now, math.radians(self._sim_yaw), math.radians(yawspeed))
+            if self.on_attitude is not None:
+                self.on_attitude(t_now, self._sim_yaw, yawspeed, None)
+        timer = threading.Timer(delay_s, _emit)
+        timer.daemon = True
+        timer.start()
 
     def yaw_rate_to_pwm(self, yaw_rate_deg_s: float) -> int:
         """Quy đổi tốc độ góc Yaw (deg/s) sang xung PWM kênh 4 quanh giá trị trung tâm (1500 us)."""
@@ -170,7 +192,7 @@ class MAVLinkClient:
         Trả về thời điểm gửi (time.monotonic()) để đo độ trễ.
         """
         if self.dry_run or self.master is None:
-            if self.dry_run and self.on_attitude is not None:
+            if self.dry_run and (self.telemetry_enabled or self.on_attitude is not None):
                 self._simulate_attitude(cmd.yaw_rate)
             return time.monotonic()
 

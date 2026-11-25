@@ -24,29 +24,37 @@ class TelemetryStats:
     yaw_rate_deg_s: float = 0.0
     vx_m_s: float = 0.0
     debug_lines: Optional[list] = None  # Các dòng thông số debug (từ metrics.DebugMetrics)
+    state: str = "IDLE"                 # IDLE | TRACK | COAST | SEARCH_HOLD
+    error_deg_now: Optional[float] = None
+    reacquire_count: int = 0
+    predicted_x_px: Optional[float] = None
 
 class TrackingVisualizer:
     """
     Module hiển thị giao diện HUD trực quan và gọn nhẹ lên cửa sổ Camera:
-    1. Đường tâm ngắm và vùng chết góc Yaw (Deadband Zone).
-    2. Khung bao từng người: Vàng (chưa chọn), Xanh lá (đang khóa bám theo).
-    3. Bảng thông số Telemetry góc trên bên trái & thanh hướng dẫn tối giản ở đáy màn hình.
+    - hud_mode='minimal' (mặc định): siêu nhẹ, không frame.copy()/addWeighted, chỉ vẽ bbox,
+      đường tâm và 1 dòng trạng thái ngắn để chọn mục tiêu trên Flask mà không tốn CPU.
+    - hud_mode='full': vẽ đầy đủ bảng Telemetry + bảng Debug.
+    - hud_mode='off': tắt hoàn toàn việc vẽ HUD.
     """
     def __init__(
         self,
         frame_width: int = 640,
         frame_height: int = 480,
         yaw_deadband_px: float = 15.0,
-        terminal_log_interval: float = 0.5,
+        terminal_log_interval: float = 0.0,
         fps_alpha: float = 0.15,
+        hud_mode: str = "minimal",
     ):
         self.frame_width = frame_width
         self.frame_height = frame_height
         self.center_x = int(frame_width / 2)
         self.center_y = int(frame_height / 2)
         self.yaw_deadband = int(yaw_deadband_px)
-        self.terminal_log_interval = terminal_log_interval
+        self.terminal_log_interval = float(terminal_log_interval)
         self.fps_alpha = fps_alpha
+        mode = str(hud_mode).lower()
+        self.hud_mode = mode if mode in ("minimal", "full", "off") else "minimal"
 
         self._prev_frame_time: Optional[float] = None
         self._smoothed_fps: float = 0.0
@@ -201,20 +209,89 @@ class TrackingVisualizer:
             1,
         )
 
+    def _draw_minimal(
+        self,
+        frame: np.ndarray,
+        detections: list[DetectedPerson],
+        stats: TelemetryStats,
+    ):
+        """Chế độ HUD tối giản: không copy/blend ảnh, chỉ vẽ tâm, bbox, dấu COAST và 1 dòng trạng thái."""
+        cv2.line(frame, (self.center_x, 0), (self.center_x, self.frame_height), (255, 255, 0), 1)
+        cv2.line(frame, (self.center_x - 8, self.center_y), (self.center_x + 8, self.center_y), (255, 255, 0), 1)
+
+        for person in detections:
+            x1, y1, x2, y2 = person.bbox
+            is_locked = stats.locked_id is not None and person.track_id == stats.locked_id
+            color = (0, 255, 0) if is_locked else (0, 215, 255)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2 if is_locked else 1)
+            cv2.putText(
+                frame,
+                f"#{person.track_id}",
+                (x1, max(16, y1 - 4)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1,
+            )
+
+        if stats.state in ("COAST", "SEARCH_HOLD") and stats.predicted_x_px is not None:
+            px = max(0, min(self.frame_width - 1, int(round(stats.predicted_x_px))))
+            py = self.center_y
+            cv2.line(frame, (px - 8, py), (px + 8, py), (0, 165, 255), 2)
+            cv2.line(frame, (px, py - 8), (px, py + 8), (0, 165, 255), 2)
+
+        if stats.locked_id is None:
+            status = "IDLE"
+            s_color = (0, 215, 255)
+        elif stats.state == "TRACK":
+            status = f"TRACK #{stats.locked_id} | Y:{stats.yaw_rate_deg_s:+.1f}"
+            if stats.reacquire_count > 0:
+                status += f" | R:{stats.reacquire_count}"
+            s_color = (0, 255, 0)
+        else:
+            status = f"{stats.state} #{stats.locked_id} ({stats.occlusion_elapsed_s:.1f}s)"
+            s_color = (0, 165, 255)
+
+        (tw, th), _ = cv2.getTextSize(status, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        cv2.rectangle(frame, (4, 4), (14 + tw, 14 + th), (20, 20, 20), -1)
+        cv2.putText(
+            frame,
+            status,
+            (9, 9 + th),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            s_color,
+            2,
+            cv2.LINE_AA,
+        )
+
     def draw_hud(
         self,
         frame: np.ndarray,
         detections: list[DetectedPerson],
         stats: TelemetryStats,
     ) -> np.ndarray:
-        """Vẽ toàn bộ HUD lên frame."""
+        """Vẽ HUD lên frame theo `hud_mode` ('minimal' | 'full' | 'off')."""
+        if self.hud_mode == "off":
+            return frame
+        if self.hud_mode == "minimal":
+            self._draw_minimal(frame, detections, stats)
+            return frame
+
         self._draw_center_guide(frame)
         self._draw_targets(frame, detections, stats)
+        if stats.state in ("COAST", "SEARCH_HOLD") and stats.predicted_x_px is not None:
+            px = max(0, min(self.frame_width - 1, int(round(stats.predicted_x_px))))
+            py = self.center_y
+            cv2.line(frame, (px - 10, py), (px + 10, py), (0, 165, 255), 2)
+            cv2.line(frame, (px, py - 10), (px, py + 10), (0, 165, 255), 2)
         self._draw_overlay(frame, stats)
         return frame
 
     def log_to_terminal(self, stats: TelemetryStats, now: Optional[float] = None):
-        """In thông số ra Terminal theo chu kỳ."""
+        """In thông số ra Terminal theo chu kỳ (tắt hoàn toàn nếu terminal_log_interval <= 0)."""
+        if self.terminal_log_interval <= 0.0:
+            return
         current_time = now if now is not None else time.monotonic()
         if current_time - self._last_terminal_log_time < self.terminal_log_interval:
             return

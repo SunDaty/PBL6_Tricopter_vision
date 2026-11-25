@@ -84,6 +84,79 @@ class PIDController:
         return max(min(output, self.max_out), self.min_out)
 
 
+class HysteresisDeadband:
+    """
+    Vùng chết có độ trễ (Hysteresis Deadband):
+    - Đi vào vùng chết (trả 0) khi |error| <= enter.
+    - Chỉ thoát khỏi vùng chết khi |error| > exit (exit >= enter).
+    Giúp tránh lệnh bật/tắt liên tục khi sai số dao động nhỏ quanh biên vùng chết.
+    """
+    def __init__(self, enter: float, exit: Optional[float] = None):
+        self.enter = max(0.0, float(enter))
+        self.exit = max(self.enter, float(exit) if exit is not None else self.enter)
+        self._in_deadband = False
+
+    @property
+    def in_deadband(self) -> bool:
+        return self._in_deadband
+
+    def reset(self):
+        self._in_deadband = False
+
+    def apply(self, error: float) -> float:
+        ae = abs(error)
+        if self._in_deadband:
+            if ae <= self.exit:
+                return 0.0
+            self._in_deadband = False
+        elif ae <= self.enter:
+            self._in_deadband = True
+            return 0.0
+        return math.copysign(max(0.0, ae - self.enter), error)
+
+
+class SlewRateLimiter:
+    """
+    Giới hạn tốc độ biến thiên của lệnh điều khiển (ví dụ deg/s^2 cho yaw_rate),
+    giúp đầu ra tăng/giảm và đảo chiều mượt, không gây giật cơ cấu chấp hành.
+    """
+    def __init__(self, max_rate: float, initial_dt: float = 0.1):
+        self.max_rate = max(0.0, float(max_rate))
+        self.initial_dt = max(0.01, float(initial_dt))
+        self._value = 0.0
+        self._last_time: Optional[float] = None
+
+    @property
+    def value(self) -> float:
+        return self._value
+
+    def reset(self, value: float = 0.0):
+        self._value = float(value)
+        self._last_time = None
+
+    def step(self, target: float, now: Optional[float] = None) -> float:
+        current_time = now if now is not None else time.monotonic()
+        target = float(target)
+        if self.max_rate <= 0.0:
+            self._value = target
+            self._last_time = current_time
+            return self._value
+
+        if self._last_time is None or current_time <= self._last_time:
+            dt = self.initial_dt
+        else:
+            dt = min(0.5, current_time - self._last_time)
+        self._last_time = current_time
+
+        max_step = self.max_rate * dt
+        delta = target - self._value
+        if abs(delta) > max_step:
+            self._value += math.copysign(max_step, delta)
+        else:
+            self._value = target
+        return self._value
+
+
 if __name__ == "__main__":
     print("=== Kiểm thử độc lập Module 1: controller.py (PIDController) ===")
     pid = PIDController(kp=0.1, kd=0.0, deadband=15.0, output_limits=(-25.0, 25.0))
